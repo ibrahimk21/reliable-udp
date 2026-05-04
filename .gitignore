@@ -8,7 +8,9 @@
 *.dll
 
 # Test binaries
-test_*
+/test_*.exe
+/test_*.out
+/test_*.o
 /tmp/
 
 # OS files
