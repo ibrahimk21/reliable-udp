@@ -1,0 +1,35 @@
+# Build artifacts
+*.o
+*.obj
+*.exe
+*.out
+*.a
+*.so
+*.dll
+
+# Test binaries
+test_*
+/tmp/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Project-internal
+AGENTS.md
+CLAUDE.md
+
+# Unrelated files in project root
+/game
+/main.cpp
+/seq
+/sequencer.cpp
+/tic-tac-toe.html
