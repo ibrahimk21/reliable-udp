@@ -128,6 +128,33 @@ End-to-end CLI verified with `md5sum` on a 100KB random file at 20% packet drop.
 
 ---
 
+## Benchmarks
+
+RUDP compared head-to-head with TCP on loopback under varying packet loss. Full results and methodology in [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
+
+### Throughput vs packet loss
+
+![Throughput vs packet loss](./benchmarks/throughput_vs_loss.png)
+
+Each panel is one file size. On a clean link, RUDP matches or beats TCP. Under loss, both degrade; RUDP gives up at `MAX_RETRANSMITS = 10` while TCP keeps retransmitting.
+
+### Key numbers (10 MB payload, 0% loss)
+
+| Protocol | Throughput | Implementation |
+|----------|-----------:|----------------|
+| TCP (Python test) | 280 Mbps | threaded socket I/O in Python |
+| RUDP | **2.2 Gbps** | compiled C (`rudp_sendfile` / `rudp_recvfile`) |
+
+The 8x gap at 0% loss reflects a code-path difference (Python vs C) more than a protocol difference. Run the benchmark on a Linux host with `tc netem` for a kernel-to-kernel comparison.
+
+```bash
+# Reproduce (matplotlib required)
+pip install --break-system-packages matplotlib
+python3 benchmarks/benchmark.py
+```
+
+---
+
 ## What this project demonstrates
 
 - **Transport protocol design** — header layout, packet types, in-order delivery semantics, ARQ.
@@ -165,6 +192,13 @@ For the full deep-dive — header byte layout, all algorithms in pseudocode, the
 ├── README.md             # this file
 ├── RUDP_PROJECT.md       # full technical deep-dive
 ├── CHANGELOG.md          # phase-by-phase development log
+├── benchmarks/
+│   ├── benchmark.py      # RUDP vs TCP benchmark script
+│   ├── RESULTS.md        # full results and methodology
+│   ├── results.csv       # raw per-trial data
+│   ├── summary.csv       # median per (size, drop) combination
+│   ├── throughput_vs_loss.png
+│   └── throughput_vs_size.png
 └── rudp/
     ├── rudp.h            # protocol header, packet types, checksum API
     ├── rudp.c            # header build/parse, checksum, sendto/recvfrom

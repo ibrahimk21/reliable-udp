@@ -11,7 +11,18 @@
 /test_*.exe
 /test_*.out
 /test_*.o
-/tmp/
+
+# Compiled RUDP tools
+/rudp_sendfile
+/rudp_recvfile
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Benchmark data
+/benchmarks/__pycache__/
 
 # OS files
 .DS_Store
