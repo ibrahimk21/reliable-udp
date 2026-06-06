@@ -14,23 +14,29 @@
 int main(int argc, char *argv[])
 {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <port> <output_file> [-drop N]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <port> <output_file> [-drop N] [-fec K=N]\n", argv[0]);
         return 1;
     }
 
     int port = atoi(argv[1]);
     const char *out_path = argv[2];
     float drop_rate = 0.0f;
-
+    int use_fec = 0;
+    int fec_k = 8;
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "-drop") == 0 && i + 1 < argc) {
             drop_rate = atof(argv[i + 1]) / 100.0f;
             i++;
+        } else if (strcmp(argv[i], "-fec") == 0) {
+            use_fec = 1;
+            if (i + 1 < argc) {
+                if (sscanf(argv[i + 1], "K=%d", &fec_k) == 1) i++;
+            }
         }
     }
 
-    fprintf(stderr, "Listening on port %d, output=%s, drop_rate=%.0f%%\n",
-            port, out_path, drop_rate * 100);
+    fprintf(stderr, "Listening on port %d, output=%s, drop_rate=%.0f%%%s\n",
+            port, out_path, drop_rate * 100, use_fec ? " [FEC]" : "");
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
@@ -92,11 +98,16 @@ int main(int argc, char *argv[])
 
     struct rudp_receiver receiver;
     rudp_receiver_init(&receiver, sockfd);
+    if (use_fec) rudp_receiver_set_fec(&receiver, fec_k, 1);
 
     int total = 0;
     if (file_size > 0) {
-        total = rudp_recv_sliding(&receiver, file_data, (int)file_size,
-                                   NULL, NULL, drop_rate);
+        if (use_fec)
+            total = rudp_recv_fec_sliding(&receiver, file_data, (int)file_size,
+                                          NULL, NULL, drop_rate);
+        else
+            total = rudp_recv_sliding(&receiver, file_data, (int)file_size,
+                                      NULL, NULL, drop_rate);
     }
     fprintf(stderr, "Received %d bytes\n", total);
 
@@ -108,10 +119,12 @@ int main(int argc, char *argv[])
         fclose(fout);
     }
 
-    while (1) {
-        n = rudp_recvfrom(sockfd, &h, NULL, 0, NULL, NULL);
-        if (n < 0) continue;
-        if (h.type == RUDP_FIN) break;
+    if (!use_fec) {
+        while (1) {
+            n = rudp_recvfrom(sockfd, &h, NULL, 0, NULL, NULL);
+            if (n < 0) continue;
+            if (h.type == RUDP_FIN) break;
+        }
     }
     fprintf(stderr, "Transfer complete: %s\n", out_path);
 

@@ -29,6 +29,7 @@ struct receiver_arg {
     char out_path[64];
     float drop_rate;
     int result;
+    int use_fec;
 };
 
 static void *receiver_thread(void *arg)
@@ -72,10 +73,15 @@ static void *receiver_thread(void *arg)
 
     struct rudp_receiver receiver;
     rudp_receiver_init(&receiver, a->sockfd);
+    if (a->use_fec) rudp_receiver_set_fec(&receiver, 8, 1);
 
     if (file_size > 0) {
-        a->result = rudp_recv_sliding(&receiver, file_data, (int)file_size,
-                                       NULL, NULL, a->drop_rate);
+        if (a->use_fec)
+            a->result = rudp_recv_fec_sliding(&receiver, file_data, (int)file_size,
+                                              NULL, NULL, a->drop_rate);
+        else
+            a->result = rudp_recv_sliding(&receiver, file_data, (int)file_size,
+                                          NULL, NULL, a->drop_rate);
     } else {
         a->result = 0;
     }
@@ -88,10 +94,12 @@ static void *receiver_thread(void *arg)
         fclose(fout);
     }
 
-    while (1) {
-        n = rudp_recvfrom(a->sockfd, &h, NULL, 0, NULL, NULL);
-        if (n < 0) continue;
-        if (h.type == RUDP_FIN) break;
+    if (!a->use_fec) {
+        while (1) {
+            n = rudp_recvfrom(a->sockfd, &h, NULL, 0, NULL, NULL);
+            if (n < 0) continue;
+            if (h.type == RUDP_FIN) break;
+        }
     }
 
     if (file_data) free(file_data);
@@ -117,7 +125,7 @@ static int make_socket(uint16_t port)
 }
 
 static void run_transfer(int label, const uint8_t *data, int data_size,
-                          float drop_rate)
+                          float drop_rate, int use_fec)
 {
     char in_path[64], out_path[64];
     snprintf(in_path,  sizeof(in_path),  "/tmp/transfer_in_%d.bin",  label);
@@ -152,6 +160,7 @@ static void run_transfer(int label, const uint8_t *data, int data_size,
     rarg.sockfd = recv_fd;
     snprintf(rarg.out_path, sizeof(rarg.out_path), "%s", out_path);
     rarg.drop_rate = drop_rate;
+    rarg.use_fec = use_fec;
 
     pthread_t thread;
     pthread_create(&thread, NULL, receiver_thread, &rarg);
@@ -159,6 +168,7 @@ static void run_transfer(int label, const uint8_t *data, int data_size,
 
     struct rudp_sender sender;
     rudp_sender_init(&sender, send_fd);
+    if (use_fec) rudp_sender_set_fec(&sender, 8, 1);
 
     struct sockaddr_in server;
     memset(&server, 0, sizeof(server));
@@ -181,8 +191,12 @@ static void run_transfer(int label, const uint8_t *data, int data_size,
 
     int ret = 0;
     if (data_size > 0) {
-        ret = rudp_send_sliding(&sender, data, data_size,
-                                 (struct sockaddr *)&server, sizeof(server));
+        if (use_fec)
+            ret = rudp_send_fec_sliding(&sender, data, data_size,
+                                        (struct sockaddr *)&server, sizeof(server));
+        else
+            ret = rudp_send_sliding(&sender, data, data_size,
+                                    (struct sockaddr *)&server, sizeof(server));
     }
 
     memset(&h, 0, sizeof(h));
@@ -194,8 +208,8 @@ static void run_transfer(int label, const uint8_t *data, int data_size,
     pthread_join(thread, NULL);
 
     char msg[128];
-    snprintf(msg, sizeof(msg), "test %d (%d%% drop): sender returned %d",
-             label, (int)(drop_rate * 100), ret);
+    snprintf(msg, sizeof(msg), "test %d (%d%% drop%s): sender returned %d",
+             label, (int)(drop_rate * 100), use_fec ? ", FEC" : "", ret);
     TEST(ret == data_size, msg);
 
     snprintf(msg, sizeof(msg), "test %d: receiver got %d bytes", label, rarg.result);
@@ -215,7 +229,8 @@ static void run_transfer(int label, const uint8_t *data, int data_size,
 
     int match = (out_size == data_size && out_data != NULL &&
                  memcmp(data, out_data, data_size) == 0);
-    snprintf(msg, sizeof(msg), "test %d: file integrity check", label);
+    snprintf(msg, sizeof(msg), "test %d: file integrity check%s",
+             label, use_fec ? " (FEC)" : "");
     TEST(match, msg);
 
     if (out_data) free(out_data);
@@ -236,10 +251,12 @@ int main(void)
 
     printf("=== File transfer test (50KB payload) ===\n");
 
-    run_transfer(1, data, data_size, 0.0f);
-    run_transfer(2, data, data_size, 0.1f);
-    run_transfer(3, data, data_size, 0.3f);
-    run_transfer(4, data, data_size, 0.5f);
+    run_transfer(1, data, data_size, 0.0f, 0);
+    run_transfer(2, data, data_size, 0.1f, 0);
+    run_transfer(3, data, data_size, 0.3f, 0);
+    run_transfer(4, data, data_size, 0.5f, 0);
+    run_transfer(5, data, data_size, 0.1f, 1);
+    run_transfer(6, data, data_size, 0.3f, 1);
 
     free(data);
 

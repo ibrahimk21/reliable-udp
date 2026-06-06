@@ -75,6 +75,30 @@ Wrote the README, the full technical deep-dive (`RUDP_PROJECT.md`), and this cha
 
 **Final tally: 75/75 tests pass. ~1,000 lines of C, zero external libraries.**
 
+## Phase 7 — Forward Erasure Correction (XOR FEC)
+
+Added an optional Forward Erasure Correction layer to the file-transfer application. Each block of K=8 data packets is augmented with a single XOR parity packet; the receiver can recover one lost packet per block without waiting for ARQ retransmit.
+
+- New packet type `RUDP_FEC = 0x05`. `RUDP_FIN` stays at `0x04`.
+- `rudp/fec.h` and `rudp/fec.c` — XOR encoder/decoder, ~50 lines, no malloc.
+- `rudp_send_fec_sliding` / `rudp_recv_fec_sliding` — sender/receiver variants for FEC mode.
+- Sender pads files smaller than one block up to K packets and sends parity. Final partial block has no parity (handled on RUDP_FIN).
+- `-fec [K=N]` flag added to `rudp_sendfile` / `rudp_recvfile`. Default K=8.
+- **8 unit tests pass** in `test_fec.c`: encoder identity, single-bit recovery, multi-bit recovery from K=4, padding round-trip, all-zero payload, random data integrity, parity regeneration, large buffer (8 KB).
+- **All 89 unit tests pass** (Phase 1-6 + Phase 7).
+
+**Bug found & fixed — sender deadlock**: initial FEC receiver design used a block-based bitmap, so the SACK payload was `0` for the first 32 packets in a block. Sender's `if (ca >= send_base)` branch never fired, the sender's bitmap-processing saw no set bits, and the RTO loop could only retransmit the oldest missing slot — never advancing the window. Rewrote `rudp_receiver` to keep a sliding-window bitmap (offsets `[next_expected, next_expected+32)`) for SACK. Block delivery now shifts the window by K and resets the bitmap. All retransmits/SACK logic now work as in the non-FEC path.
+
+**Bug found & fixed — block_start off-by-one**: after the first block is delivered, `fec_block_start += K` made it 8 (should be 9). The next block's parity was rejected as out-of-range. Fixed by setting `fec_block_start = r->next_expected` after the window shift.
+
+**Benchmark finding**: integrated RUDP-FEC into the existing C-vs-C benchmark. Across 3 file sizes × 4 drop rates × 3 protocols × 3 trials (108 trials, 27.2 min), RUDP-FEC is *slower* than RUDP at 1-10% loss. The reason: the sender still uses per-packet SACK-based flow control, and block delivery adds state-management overhead. Naive XOR FEC layered on sliding-window ARQ is a pessimization for the 1-10% loss range. Documented in `benchmarks/RESULTS.md`.
+
+## Final — Phase 7 (Mon Jun 1)
+
+Updated `benchmarks/RESULTS.md` with the 3-way comparison, regenerated graphs via `analyze.py`. Updated `README.md` and `RUDP_PROJECT.md` to mention Phase 7. Pushed to GitHub.
+
+**Tally: 89/89 unit tests pass. ~1,400 lines of C, zero external libraries.**
+
 ---
 
 ## Tuning constants

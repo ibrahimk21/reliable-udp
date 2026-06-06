@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-Fair RUDP vs TCP benchmark on loopback (WSL).
+Fair RUDP vs RUDP-FEC vs TCP benchmark on loopback (WSL).
 
-Both protocols are tested with the same C code path, the same I/O pattern,
+All three protocols are tested with the same C code path, the same I/O pattern,
 and the same loss proxy. The only difference is the transport itself.
 
 Methodology:
-  - Both RUDP and TCP CLI tools are written in C.
+  - RUDP, RUDP-FEC, and TCP CLI tools are all written in C.
   - A single C loss_proxy injects packet loss symmetrically.
-  - For UDP (RUDP): real packet drops in the sender->receiver direction.
+  - For UDP (RUDP, RUDP-FEC): real packet drops in the sender->receiver direction.
     SACK/FIN/ACK flow freely so the receiver can drive retransmits.
   - For TCP: delay-based "loss" cost (proxy sleeps 100ms then forwards),
     approximating the RTO retransmit cost of a real lossy link.
     (WSL has no kernel-level loss injection: no tc netem, no iptables.)
-  - Same loss seed for both protocols per trial, deterministic pattern.
+  - Same loss seed for all protocols per trial, deterministic pattern.
   - Per-trial timeout: 60 s. Failures recorded as throughput=0.
   - Trials: 3 per (size, drop) combination.
+  - Drops: 0, 1, 5, 10 %. (20% omitted to keep runtime within 30 min.)
 
 Outputs:
   results.csv                 - raw per-trial data
@@ -34,13 +35,12 @@ from pathlib import Path
 from statistics import median
 
 FILE_SIZES = [
-    ("1KB",    1 * 1024),
     ("100KB",  100 * 1024),
     ("1MB",    1024 * 1024),
     ("10MB",   10 * 1024 * 1024),
 ]
-DROP_RATES = [0, 1, 5, 10, 20]
-TRIALS = 5
+DROP_RATES = [0, 1, 5, 10]
+TRIALS = 3
 PER_TRIAL_TIMEOUT_S = 60
 RECV_SETTLE_S = 0.3
 RECV_PORT_BASE = 21000
@@ -123,7 +123,7 @@ def start_proc(args, log_path):
 
 
 def start_proxy(protocol, listen_port, upstream_port, drop_pct, seed, log_path):
-    if protocol == "rudp":
+    if protocol in ("rudp", "rudp_fec"):
         return start_proc([
             str(LOSS_PROXY), "-proto", "udp",
             "-listen", str(listen_port),
@@ -160,16 +160,24 @@ def run_trial(protocol, size_bytes, drop_pct, trial, file_path):
     proxy = start_proxy(protocol, proxy_port, recv_port, drop_pct, seed, proxy_log)
     time.sleep(0.2)
 
-    if protocol == "rudp":
-        recv = start_proc([str(RUDP_RECVFILE), str(recv_port), str(recv_path)],
-                          recv_log)
+    if protocol in ("rudp", "rudp_fec"):
+        if protocol == "rudp_fec":
+            recv = start_proc([str(RUDP_RECVFILE), str(recv_port), str(recv_path),
+                               "-fec", "K=8"], recv_log)
+        else:
+            recv = start_proc([str(RUDP_RECVFILE), str(recv_port), str(recv_path)],
+                              recv_log)
     else:
         recv = start_proc([str(TCP_RECVFILE), str(recv_port), str(recv_path)],
                           recv_log)
     time.sleep(0.2)
 
-    if protocol == "rudp":
-        send_cmd = [str(RUDP_SENDFILE), "127.0.0.1", str(proxy_port), str(file_path)]
+    if protocol in ("rudp", "rudp_fec"):
+        if protocol == "rudp_fec":
+            send_cmd = [str(RUDP_SENDFILE), "127.0.0.1", str(proxy_port),
+                        str(file_path), "-fec", "K=8"]
+        else:
+            send_cmd = [str(RUDP_SENDFILE), "127.0.0.1", str(proxy_port), str(file_path)]
     else:
         send_cmd = [str(TCP_SENDFILE), "127.0.0.1", str(proxy_port), str(file_path)]
 
@@ -210,7 +218,7 @@ def throughput_mbps(elapsed, n_bytes):
 
 def main():
     log("=" * 60)
-    log("Fair RUDP vs TCP benchmark (both in C, symmetric loss proxy)")
+    log("Fair RUDP vs RUDP-FEC vs TCP benchmark (all C, symmetric loss proxy)")
     log("=" * 60)
 
     if not all(p.exists() for p in [RUDP_SENDFILE, RUDP_RECVFILE,
@@ -223,7 +231,7 @@ def main():
         gen_data_file(TMP_DIR / f"data_{size_bytes}.bin", size_bytes)
 
     results = []
-    total = len(FILE_SIZES) * len(DROP_RATES) * TRIALS * 2
+    total = len(FILE_SIZES) * len(DROP_RATES) * TRIALS * 3
     current = 0
     bench_start = time.perf_counter()
 
@@ -231,7 +239,7 @@ def main():
         file_path = TMP_DIR / f"data_{size_bytes}.bin"
         for drop_pct in DROP_RATES:
             for trial in range(TRIALS):
-                for protocol in ("rudp", "tcp"):
+                for protocol in ("rudp", "rudp_fec", "tcp"):
                     current += 1
                     log(f"[{current}/{total}] {protocol:4s} size={size_label:5s} "
                         f"drop={drop_pct:2d}% trial={trial+1}")
@@ -277,7 +285,7 @@ def main():
     for r in results:
         key = (r["size_bytes"], r["drop_pct"])
         if key not in summary:
-            summary[key] = {"rudp": [], "tcp": []}
+            summary[key] = {"rudp": [], "rudp_fec": [], "tcp": []}
         if r["mbps"] > 0:
             summary[key][r["protocol"]].append(r["mbps"])
 
@@ -288,6 +296,8 @@ def main():
             "drop_pct": drop_pct,
             "rudp_mbps_median": (round(median(summary[(size_bytes, drop_pct)]["rudp"]), 2)
                                   if summary[(size_bytes, drop_pct)]["rudp"] else 0.0),
+            "rudp_fec_mbps_median": (round(median(summary[(size_bytes, drop_pct)]["rudp_fec"]), 2)
+                                      if summary[(size_bytes, drop_pct)]["rudp_fec"] else 0.0),
             "tcp_mbps_median": (round(median(summary[(size_bytes, drop_pct)]["tcp"]), 2)
                                  if summary[(size_bytes, drop_pct)]["tcp"] else 0.0),
         }

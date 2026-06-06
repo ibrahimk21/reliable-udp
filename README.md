@@ -2,7 +2,7 @@
 
 A complete implementation of a **Reliable UDP** (RUDP) protocol written in C over POSIX sockets, with a sliding window, Selective ACK (SACK), adaptive retransmission timeout, and a working file-transfer application on top. No external libraries — just the C standard library and BSD sockets.
 
-75 tests pass across 0–100% packet drop scenarios. End-to-end file transfers are MD5-verified.
+75+ unit tests pass across 0–100% packet drop scenarios. End-to-end file transfers are MD5-verified. Includes an optional Forward Erasure Correction (FEC) layer.
 
 ---
 
@@ -10,20 +10,21 @@ A complete implementation of a **Reliable UDP** (RUDP) protocol written in C ove
 
 Transmits a byte stream reliably over UDP. Under the hood: 14-byte packed binary header with Internet checksum, in-order delivery, automatic retransmission, sliding-window flow control with Selective ACK, and a dynamic RTO that adapts to measured round-trip time.
 
-The whole thing is roughly 1,000 lines of C in a single `rudp/` directory.
+The whole thing is roughly 1,400 lines of C in a single `rudp/` directory.
 
 ---
 
 ## Features
 
-- **Custom binary protocol** — 14-byte packed header (`__attribute__((packed))`), 5 packet types (DATA / ACK / SACK / SYN / FIN), Internet checksum.
+- **Custom binary protocol** — 14-byte packed header (`__attribute__((packed))`), 6 packet types (DATA / ACK / SACK / SYN / FIN / FEC), Internet checksum.
 - **Stop-and-wait ARQ** with retransmit timer, duplicate detection, and graceful give-up after `MAX_RETRANSMITS`.
 - **Sliding window** with per-packet sender slots (window = 32), Selective ACK bitmap for efficient gap reporting.
 - **Out-of-order buffering** on the receiver side, with in-order delivery to the application.
 - **Adaptive RTT/RTO** using RFC 6298 Jacobson/Karels with fixed-point arithmetic and Karn's algorithm (no RTT sampling for retransmitted packets).
-- **File transfer application** — `rudp_sendfile` and `rudp_recvfile` CLI tools with a small metadata header (magic, size, filename) for handshake.
+- **Forward Erasure Correction (XOR FEC)** — optional, K=8 data packets per block plus 1 parity packet. Receiver recovers a single lost packet per block without ARQ. See `rudp/fec.c` (~50 lines).
+- **File transfer application** — `rudp_sendfile` and `rudp_recvfile` CLI tools with a small metadata header (magic, size, filename) for handshake. Add `-fec` to enable forward error correction.
 - **Configurable server-side packet drop** for testing under lossy conditions without external tools.
-- **75 tests** — unit tests for the checksum, header, ARQ, sliding window, RTO, and end-to-end file integrity.
+- **89 tests** — unit tests for the checksum, header, ARQ, sliding window, RTO, FEC, and end-to-end file integrity.
 
 ---
 
@@ -75,11 +76,13 @@ gcc -Wall -Wextra -pedantic -std=c99 -pthread \
 gcc -Wall -Wextra -pedantic -std=c99 -pthread \
     -o test_rto test_rto.c rudp.c rudp_reliable.c
 gcc -Wall -Wextra -pedantic -std=c99 -pthread \
-    -o test_file test_file.c rudp.c rudp_reliable.c
+    -o test_fec test_fec.c fec.c
 gcc -Wall -Wextra -pedantic -std=c99 -pthread \
-    -o rudp_sendfile rudp_sendfile.c rudp.c rudp_reliable.c
+    -o test_file test_file.c rudp.c rudp_reliable.c fec.c
 gcc -Wall -Wextra -pedantic -std=c99 -pthread \
-    -o rudp_recvfile rudp_recvfile.c rudp.c rudp_reliable.c
+    -o rudp_sendfile rudp_sendfile.c rudp.c rudp_reliable.c fec.c
+gcc -Wall -Wextra -pedantic -std=c99 -pthread \
+    -o rudp_recvfile rudp_recvfile.c rudp.c rudp_reliable.c fec.c
 ```
 
 Run the test suite (each binary is a standalone test runner):
@@ -90,7 +93,8 @@ Run the test suite (each binary is a standalone test runner):
 ./test_reliable    # 16 tests: stop-and-wait ARQ, 0-100% drop
 ./test_sliding     #  9 tests: sliding window + SACK
 ./test_rto         #  8 tests: RTT convergence + Karn
-./test_file        # 12 tests: file transfer at 0/10/30/50% drop
+./test_fec         #  8 tests: XOR encoder/decoder
+./test_file        # 18 tests: file transfer at 0/10/30/50% drop, with/without FEC
 ```
 
 End-to-end file transfer (in two terminals):
@@ -110,6 +114,20 @@ Test with simulated packet loss:
 ./rudp_recvfile 17000 received.bin -drop 20
 ```
 
+Test with Forward Erasure Correction:
+
+```bash
+# Receiver enables XOR FEC (K=8, P=1)
+./rudp_recvfile 17000 received.bin -fec
+
+# Sender matches: must use same K
+./rudp_sendfile 127.0.0.1 17000 myfile.bin -fec
+
+# Custom K: e.g. K=4
+./rudp_recvfile 17000 received.bin -fec K=4
+./rudp_sendfile 127.0.0.1 17000 myfile.bin -fec K=4
+```
+
 ---
 
 ## Test results
@@ -121,8 +139,9 @@ Test with simulated packet loss:
 | `test_reliable` | 16 | Stop-and-wait ARQ, 0/20/50/100% drop, duplicate detection |
 | `test_sliding` | 9 | Sliding window, SACK bitmap, out-of-order delivery, 5KB payload |
 | `test_rto` | 8 | RTT convergence, RTO clamping, Karn's algorithm |
-| `test_file` | 12 | End-to-end file transfer, 50KB at 0/10/30/50% drop, integrity check |
-| **Total** | **75** | |
+| `test_fec` | 8 | XOR encoder/decoder: identity, single-bit recovery, multi-bit recovery, padding, large buffer |
+| `test_file` | 18 | End-to-end file transfer, 50KB at 0/10/30/50% drop, with/without FEC |
+| **Total** | **89** | |
 
 End-to-end CLI verified with `md5sum` on a 100KB random file at 20% packet drop.
 
@@ -130,22 +149,23 @@ End-to-end CLI verified with `md5sum` on a 100KB random file at 20% packet drop.
 
 ## Benchmarks
 
-RUDP compared head-to-head with TCP on loopback under varying packet loss. Full results and methodology in [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
+RUDP, RUDP-FEC, and TCP compared head-to-head on loopback under varying packet loss. Full results and methodology in [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
 
 ### Throughput vs packet loss
 
 ![Throughput vs packet loss](./benchmarks/throughput_vs_loss.png)
 
-Each panel is one file size. On a clean link, RUDP matches or beats TCP. Under loss, both degrade; RUDP gives up at `MAX_RETRANSMITS = 10` while TCP keeps retransmitting.
+Each panel is one file size. Three protocols: RUDP (ARQ only), RUDP-FEC (ARQ + XOR parity, K=8), and TCP. RUDP-FEC is slower than RUDP at 1-10% loss in this implementation — naive XOR FEC layered on sliding-window ARQ is a pessimization in that range; see RESULTS.md for the architectural analysis.
 
 ### Key numbers (10 MB payload, 0% loss)
 
 | Protocol | Throughput | Implementation |
 |----------|-----------:|----------------|
-| TCP (Python test) | 280 Mbps | threaded socket I/O in Python |
-| RUDP | **2.2 Gbps** | compiled C (`rudp_sendfile` / `rudp_recvfile`) |
+| TCP | ~1.27 Gbps | compiled C (`tcp_sendfile` / `tcp_recvfile`) |
+| RUDP | ~316 Mbps | compiled C (`rudp_sendfile` / `rudp_recvfile`) |
+| RUDP-FEC | ~503 Mbps | compiled C (`rudp_sendfile`/`rudp_recvfile` with `-fec`) |
 
-The 8x gap at 0% loss reflects a code-path difference (Python vs C) more than a protocol difference. Run the benchmark on a Linux host with `tc netem` for a kernel-to-kernel comparison.
+All three are kernel-bypass userspace implementations talking over loopback; the rankings reflect a combination of protocol design and code-path overhead.
 
 ```bash
 # Reproduce (matplotlib required)
@@ -169,7 +189,7 @@ python3 benchmarks/benchmark.py
 
 ## How it works (1-paragraph version)
 
-The sender chops the byte stream into ≤1024-byte payloads, wraps each in a 14-byte header (with checksum), and pushes them through a sliding window of 32 unACKed packets. The receiver validates the checksum, delivers in-order payloads to the application, buffers out-of-order ones, and replies with a Selective ACK packet (cumulative ACK + 32-bit bitmap of post-ACK gaps). The sender uses each SACK to free slots, and retransmits any slot whose RTT-since-send exceeds the current RTO. The RTO is updated on every fresh (non-retransmitted) ACK using Jacobson/Karels, clamped to [100ms, 10s], with Karn's algorithm skipping samples for retransmitted packets to avoid ambiguity.
+The sender chops the byte stream into ≤1024-byte payloads, wraps each in a 14-byte header (with checksum), and pushes them through a sliding window of 32 unACKed packets. The receiver validates the checksum, delivers in-order payloads to the application, buffers out-of-order ones, and replies with a Selective ACK packet (cumulative ACK + 32-bit bitmap of post-ACK gaps). The sender uses each SACK to free slots, and retransmits any slot whose RTT-since-send exceeds the current RTO. The RTO is updated on every fresh (non-retransmitted) ACK using Jacobson/Karels, clamped to [100ms, 10s], with Karn's algorithm skipping samples for retransmitted packets to avoid ambiguity. In FEC mode, every K=8 data packets are followed by a single XOR parity packet; the receiver can recover one lost packet per block from the parity without waiting for an ARQ retransmit.
 
 For the full deep-dive — header byte layout, all algorithms in pseudocode, the bug postmortems, the tuning-constant justifications, and interview Q&A — see [`RUDP_PROJECT.md`](./RUDP_PROJECT.md).
 
@@ -203,14 +223,17 @@ For the full deep-dive — header byte layout, all algorithms in pseudocode, the
     ├── rudp.h            # protocol header, packet types, checksum API
     ├── rudp.c            # header build/parse, checksum, sendto/recvfrom
     ├── rudp_reliable.h   # sender/receiver structs, sliding-window API
-    ├── rudp_reliable.c   # ARQ, SACK, RTT/RTO
+    ├── rudp_reliable.c   # ARQ, SACK, RTT/RTO, FEC sender/receiver
+    ├── fec.h             # XOR FEC encoder/decoder API
+    ├── fec.c             # XOR FEC implementation (~50 lines)
     ├── rudp_file.h       # file metadata struct
-    ├── rudp_sendfile.c   # CLI: send a file
-    ├── rudp_recvfile.c   # CLI: receive a file (-drop N for testing)
+    ├── rudp_sendfile.c   # CLI: send a file (-fec for FEC mode)
+    ├── rudp_recvfile.c   # CLI: receive a file (-drop N, -fec)
     ├── test_checksum.c
     ├── test_echo.c
     ├── test_reliable.c
     ├── test_sliding.c
     ├── test_rto.c
+    ├── test_fec.c        # 8 unit tests for XOR FEC
     └── test_file.c
 ```

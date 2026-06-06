@@ -11,10 +11,20 @@
 /test_*.exe
 /test_*.out
 /test_*.o
+/rudp/test_checksum
+/rudp/test_echo
+/rudp/test_reliable
+/rudp/test_sliding
+/rudp/test_rto
+/rudp/test_fec
+/rudp/test_file
+/run_tests.sh
 
 # Compiled RUDP tools
 /rudp_sendfile
 /rudp_recvfile
+/rudp/rudp_sendfile
+/rudp/rudp_recvfile
 /benchmarks/loss_proxy
 /benchmarks/tcp_sendfile
 /benchmarks/tcp_recvfile

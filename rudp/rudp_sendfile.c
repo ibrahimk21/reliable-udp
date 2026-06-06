@@ -14,13 +14,23 @@
 int main(int argc, char *argv[])
 {
     if (argc < 4) {
-        fprintf(stderr, "Usage: %s <server_ip> <server_port> <file_path>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <server_ip> <server_port> <file_path> [-fec K=N]\n", argv[0]);
         return 1;
     }
 
     const char *server_ip = argv[1];
     int server_port = atoi(argv[2]);
     const char *file_path = argv[3];
+    int use_fec = 0;
+    int fec_k = 8;
+    for (int i = 4; i < argc; i++) {
+        if (strcmp(argv[i], "-fec") == 0) {
+            use_fec = 1;
+            if (i + 1 < argc) {
+                if (sscanf(argv[i + 1], "K=%d", &fec_k) == 1) i++;
+            }
+        }
+    }
 
     FILE *f = fopen(file_path, "rb");
     if (!f) {
@@ -74,6 +84,7 @@ int main(int argc, char *argv[])
 
     struct rudp_sender sender;
     rudp_sender_init(&sender, sockfd);
+    if (use_fec) rudp_sender_set_fec(&sender, fec_k, 1);
 
     struct rudp_file_metadata meta;
     memset(&meta, 0, sizeof(meta));
@@ -93,12 +104,17 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    fprintf(stderr, "Sending %s (%ld bytes)...\n", filename, file_size);
+    fprintf(stderr, "Sending %s (%ld bytes)%s\n", filename, file_size,
+            use_fec ? " [FEC]" : "");
 
     int ret = 0;
     if (file_size > 0) {
-        ret = rudp_send_sliding(&sender, file_data, (int)file_size,
-                                 (struct sockaddr *)&server, sizeof(server));
+        if (use_fec)
+            ret = rudp_send_fec_sliding(&sender, file_data, (int)file_size,
+                                        (struct sockaddr *)&server, sizeof(server));
+        else
+            ret = rudp_send_sliding(&sender, file_data, (int)file_size,
+                                    (struct sockaddr *)&server, sizeof(server));
         if (ret < 0) {
             fprintf(stderr, "send failed\n");
             close(sockfd);

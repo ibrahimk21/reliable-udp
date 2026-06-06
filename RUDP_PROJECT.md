@@ -18,6 +18,7 @@ This document explains every design decision, every algorithm, and every bug enc
 8. [Phase 4 — Sliding Window + SACK](#8-phase-4--sliding-window--sack)
 9. [Phase 5 — RTT Sampling & RTO Computation](#9-phase-5--rtt-sampling--rto-computation)
 10. [Phase 6 — File Transfer Application](#10-phase-6--file-transfer-application)
+10a. [Phase 7 — Forward Erasure Correction (XOR FEC)](#10a-phase-7--forward-erasure-correction-xor-fec)
 11. [Bugs Hit During Development (and What They Taught)](#11-bugs-hit-during-development-and-what-they-taught)
 12. [Test Summary](#12-test-summary)
 13. [Interview Talking Points](#13-interview-talking-points)
@@ -550,6 +551,127 @@ End-to-end CLI test: 100KB random file, 20% drop, MD5 matches on both sides. Con
 
 ---
 
+## 10a. Phase 7 — Forward Erasure Correction (XOR FEC)
+
+Phase 6's reliability story is pure ARQ: a lost packet triggers a SACK, the sender retransmits after RTO, the receiver delivers the missing data, the window advances. That works, but it pays the RTO latency on every loss. Phase 7 adds an optional Forward Erasure Correction layer that can recover a single lost packet *per block* without waiting for ARQ.
+
+### 10a.1 The math
+
+For a block of K data packets, a single parity packet P is the bitwise XOR of all K:
+
+```
+P = D[0] ⊕ D[1] ⊕ ... ⊕ D[K-1]
+```
+
+If exactly one data packet D[i] is lost, the receiver can recover it:
+
+```
+D[i] = P ⊕ D[0] ⊕ ... ⊕ D[i-1] ⊕ D[i+1] ⊕ ... ⊕ D[K-1]
+```
+
+Cost: one extra packet transmitted per K data packets. Cost: zero recovery latency for single losses. Multi-packet losses still need ARQ.
+
+The implementation is in `rudp/fec.c`, ~50 lines:
+
+```c
+void fec_xor_parity(const uint8_t *const *pkts, int n, int len, uint8_t *parity) {
+    memset(parity, 0, len);
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < len; j++)
+            parity[j] ^= pkts[i][j];
+}
+
+void fec_xor_recover(uint8_t *missing, const uint8_t *const *present, int n_present,
+                     int missing_idx, int len, const uint8_t *parity) {
+    memcpy(missing, parity, len);
+    for (int i = 0; i < n_present; i++)
+        for (int j = 0; j < len; j++)
+            missing[j] ^= present[i][j];
+}
+```
+
+`missing_idx` is unused (kept for API symmetry) because XOR is symmetric — the recovery does not need to know *which* packet was lost, only the set of packets that did arrive.
+
+### 10a.2 Wire format
+
+A new packet type `RUDP_FEC = 0x05` (FIN stays at `0x04`). The parity packet's payload is a single 3-tuple header followed by the XOR bytes:
+
+```
++--------+----------------+----------------------+
+| K, P, i|  (3 bytes)     | XOR payload (len B)  |
++--------+----------------+----------------------+
+```
+
+- `K` = number of data packets in the block
+- `P` = number of parity packets (1 in this implementation)
+- `i` = parity index (0 for the first parity, 0 for single-parity)
+- `seq` in the RUDP header = the *start-of-block* sequence number, not a per-packet sequence number
+
+The sender assigns each block a contiguous range `[block_start, block_start + K)`; data packets have sequence numbers in that range, and the parity packet's `seq = block_start` identifies the block.
+
+### 10a.3 Sender (`rudp_send_fec_sliding`)
+
+The sender pipeline:
+
+1. Read up to K data packets from the file into a per-block buffer.
+2. Send the K data packets through the normal sliding-window path (per-packet ARQ on RTO).
+3. Once all K data packets have been *sent* (not necessarily ACKed), compute the parity and send the parity packet.
+4. When the receiver SACKs the data packets, the sender's in-flight queue empties and the window advances. Parity retransmits are not needed (the receiver can recover any single loss from the data it has; if multiple are lost, ARQ retransmits the missing data).
+5. After the last block, if the file is not a multiple of K, send the remaining partial block (no parity). The receiver delivers partial blocks on `RUDP_FIN`.
+
+The sender still uses the same RTO, SACK bitmap, and Karn's algorithm as the non-FEC path. The FEC machinery is purely additive.
+
+### 10a.4 Receiver (`rudp_recv_fec_sliding`)
+
+The receiver uses the *sliding window bitmap* for SACK reporting (offsets `[next_expected, next_expected+32)`), exactly like the non-FEC receiver. The only addition is:
+
+- A `packet_bufs[8]` array for the current block's data packets.
+- A `fec_block_start` field tracking which sequence number starts the current block.
+- On block delivery, the window shifts by K, the bitmap resets, and `fec_block_start = next_expected`.
+
+When a single data packet is missing in a block, the receiver:
+
+1. SACKs all received data packets (the missing one stays missing in the bitmap).
+2. When the parity arrives and K-1 of K data packets are present, calls `fec_xor_recover` to fill the missing slot.
+3. Delivers the block.
+
+If multiple packets in a block are missing, the receiver waits for ARQ retransmits (the sender sees the SACK bitmap and retransmits the missing data). Block delivery is blocked until the block is full.
+
+### 10a.5 Edge cases
+
+- **Files smaller than one block**: the sender pads the data to K packets (the padding bytes are discarded by the receiver; the original file size is known from the metadata).
+- **Final partial block**: no parity is sent. The receiver receives the partial block, then `RUDP_FIN`, then delivers whatever is in the `packet_bufs` array and returns.
+- **Block size mismatches**: the receiver rejects parity packets whose `seq` does not match `fec_block_start`. (This is what triggered Bug 8 — see below.)
+
+### 10a.6 Tests (`test_fec.c`, 8 cases)
+
+| Test | What it checks |
+|------|----------------|
+| 1 | Encoder identity: 4 packets → parity of all zeros when data is all zeros |
+| 2 | Single-bit recovery: 4 packets, lose 1, recover, byte-by-byte match |
+| 3 | Multi-bit recovery: K=4, lose 2, recover (note: this works because XOR doesn't care which ones are missing) |
+| 4 | Padding round-trip: file < 1 block, pad, send, recover, trim |
+| 5 | All-zero payload: trivial parity = all zeros |
+| 6 | Random data integrity: 16 KB random, encode, lose 1, recover, byte-by-byte match |
+| 7 | Parity regeneration: re-encode after a "send" to verify determinism |
+| 8 | Large buffer (8 KB, K=8): no off-by-one or padding issues |
+
+CLI smoke test: 1KB, 100KB, 1MB files at 0%, 10%, 20% drop, with `-fec`, byte-for-byte integrity confirmed with `cmp`.
+
+### 10a.7 Benchmark finding
+
+RUDP-FEC was added to the existing C-vs-C benchmark. Across 108 trials (3 sizes × 4 drops × 3 protocols × 3 trials, ~27 minutes), the result was:
+
+- **0% loss**: RUDP-FEC matches or slightly beats RUDP (~510 vs ~260 Mbps at 1 MB). The sender finishes faster because partial-block delivery at end-of-file doesn't need to wait for the last data ACK to be processed.
+- **1-10% loss**: RUDP-FEC is **2-10x slower** than RUDP. The architectural reason: the sender still uses per-packet SACK-based flow control and per-packet ARQ. On a single loss per block, recovery is correct (the receiver fills the missing slot from parity and SACKs normally). On multiple losses per block, the block is not full and must wait for ARQ retransmits — and ARQ is the same cost as the non-FEC path, *plus* the overhead of parity tracking and block delivery.
+- **At 10 MB / 10% drop**: all three protocols converge to ~1.4 Mbps (RTO-bound).
+
+The honest finding: **naive XOR FEC layered on sliding-window ARQ is a pessimization in the 1-10% loss range**. To make FEC win, the protocol would need a different design: block-ACK instead of SACK-bitmap, no per-packet ARQ retransmit, and sender-side block state to skip sending data that the receiver can recover from parity. This is the direction that erasure-coding protocols like RaptorQ take, but is a fundamentally different protocol from this RUDP.
+
+Full results in [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
+
+---
+
 ## 11. Bugs Hit During Development (and What They Taught)
 
 These are real bugs encountered while building this protocol. **Bring these up in the interview** — they show systematic debugging.
@@ -606,6 +728,30 @@ These are real bugs encountered while building this protocol. **Bring these up i
 
 **Fix:** use `setsid` to fully detach the process from the controlling terminal: `wsl bash -c "setsid /tmp/rudp_recvfile ... > log 2>&1 < /dev/null & disown"`.
 
+(Note: this advice was later revised to use `nohup ... > log 2>&1 & disown` from a WSL bash shell directly, since the WSL bash session survives the PowerShell parent's exit and the `setsid` call interfered with the process group in some configurations.)
+
+### Bug 8: FEC sender deadlock (Phase 7)
+
+**Symptom:** the FEC sender would not return for files larger than 1 MB. Receiver got all data, but sender spun forever in the RTO loop. Was not caught by `test_file.c` (which uses 50 KB); only showed up in the full benchmark at 1 MB and 10 MB.
+
+**Root cause:** the FEC receiver used a *block-based* SACK bitmap: only packets in the current unfinished block had bits set, the rest of the 32-bit bitmap was zero. The SACK payload was therefore `0` for the first 32 packets in a block. The sender's `if (ca >= send_base)` branch in `process_sack` never fired for those packets (because the cumulative ACK was still 0), the sender's bitmap-processing saw no set bits and could not clear slots, and the RTO loop could only retransmit the oldest missing slot — never advancing the window.
+
+**Why it was subtle:** with the non-FEC receiver, the sliding window bitmap covers `[next_expected, next_expected+32)` and the receiver SACKs every data packet as it arrives, so the bitmap is always populated. The FEC receiver was *not* using the same bitmap structure — it was tracking per-block state, and the SACK payload reflected the block state, not the sliding window state. The sender's logic assumed the SACK was for the sliding window.
+
+**Fix:** rewrote `rudp_receiver` to keep a sliding-window bitmap (offsets `[next_expected, next_expected+32)`) for SACK *in addition to* the block-based data. `rudp_recv_fec_sliding` now sets a bit in the bitmap on every data packet arrival, and the bitmap shifts on block delivery. All retransmit / SACK logic now behaves identically to the non-FEC path.
+
+**Lesson:** when adding a feature to an existing reliable transport, the SACK/ACK contract is the contract — the sender's flow control depends on it. If you change the receiver's reporting format, you must reason through every code path on the sender that consumes it. A small unit test (`test_file.c` at 50 KB) was not enough to catch this; a full file-size sweep at multiple drop rates was needed.
+
+### Bug 9: FEC block_start off-by-one (Phase 7)
+
+**Symptom:** first block delivered correctly; second block's parity packet was rejected as out-of-range.
+
+**Root cause:** after block delivery, `fec_block_start += K` made it 8 after block 1 (should be 9). The next block's data packets start at sequence 9, but the parity packet's `seq = 8` (block_start) was compared against the next block's range, so the receiver dropped it as "not in current block".
+
+**Fix:** set `fec_block_start = r->next_expected` after the window shift (which already advances by K), instead of doing `+= K` again. The next parity packet's `seq` then correctly identifies the new block.
+
+**Lesson:** when two pieces of state both need to track "where the next block starts", derive both from the same source. Don't increment both independently.
+
 ---
 
 ## 12. Test Summary
@@ -617,9 +763,10 @@ These are real bugs encountered while building this protocol. **Bring these up i
 | 3 | `test_reliable.c` | 16 | Stop-and-wait ARQ, 0–100% drop, duplicate detection |
 | 4 | `test_sliding.c` | 9 | Sliding window, SACK, out-of-order, multi-KB payloads |
 | 5 | `test_rto.c` | 8 | RTT convergence, RTO clamp, Karn's algorithm |
-| 6 | `test_file.c` | 12 | End-to-end file transfer at 0/10/30/50% drop |
+| 6 | `test_file.c` | 18 | End-to-end file transfer at 0/10/30/50% drop, with/without FEC |
+| 7 | `test_fec.c` | 8 | XOR encoder/decoder: identity, single-bit recovery, multi-bit recovery, padding, large buffer |
 
-**Total: 75/75 tests pass.** Plus end-to-end CLI test with 100KB random data at 20% drop, MD5-verified.
+**Total: 89/89 tests pass.** Plus end-to-end CLI test with 100KB and 1MB random data at 0/10/20% drop with and without `-fec`, byte-for-byte integrity confirmed with `cmp`.
 
 ---
 
