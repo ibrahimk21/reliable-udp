@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-Benchmark RUDP vs TCP under various packet-loss conditions on loopback.
+Fair RUDP vs TCP benchmark on loopback (WSL).
+
+Both protocols are tested with the same C code path, the same I/O pattern,
+and the same loss proxy. The only difference is the transport itself.
 
 Methodology:
-  - TCP: lossy proxy in the middle. Client sends to proxy (port P),
-    proxy splits data into 1KB "fake packets" and drops N% randomly,
-    forwards the rest to a real server (port P+1).
-  - RUDP: existing -drop N flag in rudp_recvfile (drops incoming UDP packets).
-  - File sizes: 1KB, 100KB, 1MB, 10MB
-  - Drop rates: 0%, 1%, 5%, 10%, 20%
-  - Trials: 3 per (size, drop) combination
-  - Metric: median throughput in Mbps, byte-exact integrity check
+  - Both RUDP and TCP CLI tools are written in C.
+  - A single C loss_proxy injects packet loss symmetrically.
+  - For UDP (RUDP): real packet drops in the sender->receiver direction.
+    SACK/FIN/ACK flow freely so the receiver can drive retransmits.
+  - For TCP: delay-based "loss" cost (proxy sleeps 100ms then forwards),
+    approximating the RTO retransmit cost of a real lossy link.
+    (WSL has no kernel-level loss injection: no tc netem, no iptables.)
+  - Same loss seed for both protocols per trial, deterministic pattern.
+  - Per-trial timeout: 60 s. Failures recorded as throughput=0.
+  - Trials: 3 per (size, drop) combination.
 
 Outputs:
   results.csv                 - raw per-trial data
@@ -18,185 +23,183 @@ Outputs:
   throughput_vs_loss.png      - line chart, one panel per file size
   throughput_vs_size.png      - bar chart at 0% loss
 """
-import subprocess
-import socket
-import threading
-import time
 import os
+import sys
+import time
 import random
+import subprocess
 import csv
+import signal
 from pathlib import Path
 from statistics import median
 
 FILE_SIZES = [
-    (1,    1024),
-    (100,  100 * 1024),
-    (1024, 1024 * 1024),
-    (10240, 10 * 1024 * 1024),
+    ("1KB",    1 * 1024),
+    ("100KB",  100 * 1024),
+    ("1MB",    1024 * 1024),
+    ("10MB",   10 * 1024 * 1024),
 ]
 DROP_RATES = [0, 1, 5, 10, 20]
-TRIALS = 3
-BASE_PORT = 18000
+TRIALS = 5
+PER_TRIAL_TIMEOUT_S = 60
+RECV_SETTLE_S = 0.3
+RECV_PORT_BASE = 21000
+PROXY_PORT_BASE = 21100
+RETV_DELAY_US = 100000
+
 TMP_DIR = Path("/tmp/bench")
 SCRIPT_DIR = Path(__file__).parent
-RUDP_SENDFILE = Path("/tmp/rudp_sendfile")
-RUDP_RECVFILE = Path("/tmp/rudp_recvfile")
-FAKE_PKT_SIZE = 1024
+RUDP_DIR = SCRIPT_DIR.parent / "rudp"
+RUDP_SENDFILE = TMP_DIR / "rudp_sendfile"
+RUDP_RECVFILE = TMP_DIR / "rudp_recvfile"
+TCP_SENDFILE = TMP_DIR / "tcp_sendfile"
+TCP_RECVFILE = TMP_DIR / "tcp_recvfile"
+LOSS_PROXY   = TMP_DIR / "loss_proxy"
+CC = ["gcc", "-Wall", "-Wextra", "-pedantic", "-std=c99", "-pthread", "-D_DEFAULT_SOURCE"]
 
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def compile_rudp_tools():
-    rudp_dir = SCRIPT_DIR.parent / "rudp"
-    log(f"Compiling RUDP CLI tools from {rudp_dir}...")
+def compile_all():
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    log("Compiling RUDP CLI tools...")
     for exe, src in [(RUDP_SENDFILE, "rudp_sendfile.c"),
                      (RUDP_RECVFILE, "rudp_recvfile.c")]:
-        subprocess.run([
-            "gcc", "-Wall", "-Wextra", "-pedantic", "-std=c99", "-pthread",
-            "-D_DEFAULT_SOURCE",
-            "-o", str(exe), str(rudp_dir / src),
-            str(rudp_dir / "rudp.c"),
-            str(rudp_dir / "rudp_reliable.c"),
-        ], check=True, capture_output=True)
+        subprocess.run(CC + ["-o", str(exe),
+                              str(RUDP_DIR / src),
+                              str(RUDP_DIR / "rudp.c"),
+                              str(RUDP_DIR / "rudp_reliable.c")],
+                       check=True, capture_output=True)
+    log("Compiling TCP CLI tools...")
+    for exe, src in [(TCP_SENDFILE, "tcp_sendfile.c"),
+                     (TCP_RECVFILE, "tcp_recvfile.c")]:
+        subprocess.run(CC + ["-o", str(exe),
+                              str(SCRIPT_DIR / src)],
+                       check=True, capture_output=True)
+    log("Compiling loss proxy...")
+    subprocess.run(CC + ["-o", str(LOSS_PROXY),
+                          str(SCRIPT_DIR / "loss_proxy.c")],
+                   check=True, capture_output=True)
     log("Compilation done.")
 
 
-def tcp_transfer_lossy(file_data, port, drop_pct, timeout=60):
-    """
-    Client -> [lossy proxy] -> Server. The proxy forwards all data correctly,
-    but for every FAKE_PKT_SIZE chunk, simulates a retransmission event with
-    probability drop_pct% (adds a short delay). The server receives all bytes.
+def gen_data_file(path, size_bytes):
+    if path.exists() and path.stat().st_size == size_bytes:
+        return
+    with open(path, "wb") as f:
+        f.write(os.urandom(size_bytes))
 
-    Measures end-to-end time (client send -> server receive complete).
-    """
-    received = []
-    error = [None]
-    server_done = threading.Event()
 
-    def server():
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind(("127.0.0.1", port + 1))
-                s.listen(1)
-                s.settimeout(timeout)
-                conn, _ = s.accept()
-                conn.settimeout(timeout)
-                data = b""
-                while True:
-                    chunk = conn.recv(65536)
-                    if not chunk:
-                        break
-                    data += chunk
-                received.append(data)
-                conn.close()
-        except Exception as e:
-            error[0] = e
-        finally:
-            server_done.set()
+def md5sum(path):
+    out = subprocess.run(["md5sum", str(path)],
+                         capture_output=True, check=True)
+    return out.stdout.decode().split()[0]
 
-    def proxy():
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind(("127.0.0.1", port))
-                s.listen(1)
-                s.settimeout(timeout)
-                client, _ = s.accept()
-                client.settimeout(timeout)
 
-                server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                server_sock.settimeout(timeout)
-                server_sock.connect(("127.0.0.1", port + 1))
+def kill_proc(proc):
+    if proc is None:
+        return
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
 
-                buf = b""
-                retransmit_delay = 0.05
-                while True:
-                    chunk = client.recv(65536)
-                    if not chunk:
-                        if buf:
-                            server_sock.sendall(buf)
-                        break
-                    buf += chunk
-                    while len(buf) >= FAKE_PKT_SIZE:
-                        pkt = buf[:FAKE_PKT_SIZE]
-                        buf = buf[FAKE_PKT_SIZE:]
-                        server_sock.sendall(pkt)
-                        if drop_pct > 0 and random.random() < drop_pct / 100.0:
-                            time.sleep(retransmit_delay)
 
-                server_sock.close()
-                client.close()
-        except Exception as e:
-            error[0] = e
+def start_proc(args, log_path):
+    f = open(log_path, "w")
+    return subprocess.Popen(
+        args,
+        stdin=subprocess.DEVNULL,
+        stdout=f,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid,
+    )
 
-    t_server = threading.Thread(target=server, daemon=True)
-    t_proxy = threading.Thread(target=proxy, daemon=True)
-    t_server.start()
-    t_proxy.start()
+
+def start_proxy(protocol, listen_port, upstream_port, drop_pct, seed, log_path):
+    if protocol == "rudp":
+        return start_proc([
+            str(LOSS_PROXY), "-proto", "udp",
+            "-listen", str(listen_port),
+            "-upstream", f"127.0.0.1:{upstream_port}",
+            "-drop", str(drop_pct), "-seed", str(seed),
+        ], log_path)
+    else:
+        return start_proc([
+            str(LOSS_PROXY), "-proto", "tcp",
+            "-listen", str(listen_port),
+            "-upstream", f"127.0.0.1:{upstream_port}",
+            "-drop", str(drop_pct), "-seed", str(seed),
+            "-retx-delay", str(RETV_DELAY_US),
+        ], log_path)
+
+
+def cleanup_all(*procs):
+    for p in procs:
+        kill_proc(p)
+
+
+def run_trial(protocol, size_bytes, drop_pct, trial, file_path):
+    port = RECV_PORT_BASE + trial * 10
+    recv_port = port
+    proxy_port = port + PROXY_PORT_BASE - RECV_PORT_BASE
+    recv_path = TMP_DIR / f"recv_{protocol}_{trial}_{size_bytes}.bin"
+
+    seed = trial * 100003 + drop_pct * 101 + size_bytes
+
+    proxy_log = TMP_DIR / f"proxy_{protocol}_{trial}.log"
+    recv_log  = TMP_DIR / f"recv_{protocol}_{trial}.log"
+    send_log  = TMP_DIR / f"send_{protocol}_{trial}.log"
+
+    proxy = start_proxy(protocol, proxy_port, recv_port, drop_pct, seed, proxy_log)
     time.sleep(0.2)
 
+    if protocol == "rudp":
+        recv = start_proc([str(RUDP_RECVFILE), str(recv_port), str(recv_path)],
+                          recv_log)
+    else:
+        recv = start_proc([str(TCP_RECVFILE), str(recv_port), str(recv_path)],
+                          recv_log)
+    time.sleep(0.2)
+
+    if protocol == "rudp":
+        send_cmd = [str(RUDP_SENDFILE), "127.0.0.1", str(proxy_port), str(file_path)]
+    else:
+        send_cmd = [str(TCP_SENDFILE), "127.0.0.1", str(proxy_port), str(file_path)]
+
+    timed_out = False
     start = time.perf_counter()
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout)
-            s.connect(("127.0.0.1", port))
-            offset = 0
-            while offset < len(file_data):
-                sent = s.send(file_data[offset:offset + 65536])
-                if sent == 0:
-                    break
-                offset += sent
-    except Exception as e:
-        error[0] = e
+        with open(send_log, "w") as f:
+            subprocess.run(send_cmd, stdin=subprocess.DEVNULL,
+                           stdout=f, stderr=subprocess.DEVNULL,
+                           timeout=PER_TRIAL_TIMEOUT_S, check=False)
+    except subprocess.TimeoutExpired:
+        timed_out = True
 
-    server_done.wait(timeout=timeout)
+    if not timed_out:
+        deadline = time.perf_counter() + 5
+        while recv.poll() is None and time.perf_counter() < deadline:
+            time.sleep(0.05)
+        if recv.poll() is None:
+            timed_out = True
     elapsed = time.perf_counter() - start
 
-    t_proxy.join(timeout=5)
-    t_server.join(timeout=5)
+    cleanup_all(recv, proxy)
+    time.sleep(RECV_SETTLE_S)
 
-    if error[0] is not None and elapsed >= timeout:
-        return -1, 0
-    rec = received[0] if received else b""
-    return elapsed, len(rec)
-
-
-def rudp_transfer(file_path, port, drop_pct, timeout=60):
-    recv_path = TMP_DIR / f"rudp_recv_{port}.bin"
     if recv_path.exists():
-        recv_path.unlink()
+        received = recv_path.stat().st_size
+    else:
+        received = 0
 
-    proc_recv = subprocess.Popen(
-        [str(RUDP_RECVFILE), str(port), str(recv_path), "-drop", str(drop_pct)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    time.sleep(0.2)
-
-    start = time.perf_counter()
-    try:
-        proc_send = subprocess.run(
-            [str(RUDP_SENDFILE), "127.0.0.1", str(port), str(file_path)],
-            capture_output=True, timeout=timeout,
-        )
-        elapsed = time.perf_counter() - start
-    except subprocess.TimeoutExpired:
-        proc_send = None
-        elapsed = -1
-
-    try:
-        proc_recv.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc_recv.kill()
-        proc_recv.wait()
-
-    if proc_send is None or proc_send.returncode != 0:
-        return -1, 0
-
-    received = recv_path.stat().st_size if recv_path.exists() else 0
-    return elapsed, received
+    return elapsed, received, timed_out
 
 
 def throughput_mbps(elapsed, n_bytes):
@@ -205,64 +208,63 @@ def throughput_mbps(elapsed, n_bytes):
     return (n_bytes * 8) / (elapsed * 1_000_000)
 
 
-def run_trial(size_bytes, drop_pct, trial_idx):
-    port = BASE_PORT + trial_idx
-    file_path = TMP_DIR / f"data_{size_bytes}.bin"
-    if not file_path.exists():
-        with open(file_path, "wb") as f:
-            f.write(random_data(size_bytes))
-
-    with open(file_path, "rb") as f:
-        file_data = f.read()
-
-    tcp_time, tcp_recv = tcp_transfer_lossy(file_data, port, drop_pct)
-    rudp_time, rudp_recv = rudp_transfer(file_path, port + 1000, drop_pct)
-
-    return {
-        "size_bytes": size_bytes,
-        "drop_pct": drop_pct,
-        "trial": trial_idx,
-        "tcp_time_s": round(tcp_time, 4),
-        "tcp_recv_bytes": tcp_recv,
-        "tcp_mbps": round(throughput_mbps(tcp_time, tcp_recv), 2),
-        "rudp_time_s": round(rudp_time, 4),
-        "rudp_recv_bytes": rudp_recv,
-        "rudp_mbps": round(throughput_mbps(rudp_time, rudp_recv), 2),
-    }
-
-
-def random_data(size):
-    return bytes(random.randint(0, 255) for _ in range(size))
-
-
 def main():
     log("=" * 60)
-    log("RUDP vs TCP Benchmark")
+    log("Fair RUDP vs TCP benchmark (both in C, symmetric loss proxy)")
     log("=" * 60)
 
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-    if not RUDP_SENDFILE.exists() or not RUDP_RECVFILE.exists():
-        compile_rudp_tools()
+    if not all(p.exists() for p in [RUDP_SENDFILE, RUDP_RECVFILE,
+                                      TCP_SENDFILE, TCP_RECVFILE, LOSS_PROXY]):
+        compile_all()
+    else:
+        log("All binaries present, skipping compilation.")
+
+    for label, size_bytes in FILE_SIZES:
+        gen_data_file(TMP_DIR / f"data_{size_bytes}.bin", size_bytes)
 
     results = []
-    total = len(FILE_SIZES) * len(DROP_RATES) * TRIALS
+    total = len(FILE_SIZES) * len(DROP_RATES) * TRIALS * 2
     current = 0
+    bench_start = time.perf_counter()
 
     for size_label, size_bytes in FILE_SIZES:
+        file_path = TMP_DIR / f"data_{size_bytes}.bin"
         for drop_pct in DROP_RATES:
             for trial in range(TRIALS):
-                current += 1
-                log(f"[{current}/{total}] size={size_label}KB, drop={drop_pct}%, trial={trial+1}")
-                try:
-                    r = run_trial(size_bytes, drop_pct, trial)
-                except Exception as e:
-                    log(f"  ERROR: {e}")
+                for protocol in ("rudp", "tcp"):
+                    current += 1
+                    log(f"[{current}/{total}] {protocol:4s} size={size_label:5s} "
+                        f"drop={drop_pct:2d}% trial={trial+1}")
+                    elapsed, received, timed_out = run_trial(
+                        protocol, size_bytes, drop_pct, trial, file_path)
+                    mbps = throughput_mbps(elapsed, received)
+                    results.append({
+                        "protocol": protocol,
+                        "size_bytes": size_bytes,
+                        "drop_pct": drop_pct,
+                        "trial": trial + 1,
+                        "elapsed_s": round(elapsed, 4),
+                        "received_bytes": received,
+                        "mbps": round(mbps, 2),
+                        "timed_out": timed_out,
+                    })
+                    tag = "TIMEOUT" if timed_out else f"{elapsed:7.3f}s"
+                    log(f"  -> {tag}, {received}/{size_bytes} bytes, {mbps:7.2f} Mbps")
+
+                    elapsed_min = (time.perf_counter() - bench_start) / 60
+                    if elapsed_min > 28:
+                        log(f"  (Approaching 30-min budget at {elapsed_min:.1f} min, "
+                            "stopping early)")
+                        break
+                else:
                     continue
-                results.append(r)
-                log(f"  TCP:  {r['tcp_time_s']:>7.3f}s, {r['tcp_mbps']:>7.2f} Mbps, "
-                    f"{r['tcp_recv_bytes']}/{size_bytes} bytes")
-                log(f"  RUDP: {r['rudp_time_s']:>7.3f}s, {r['rudp_mbps']:>7.2f} Mbps, "
-                    f"{r['rudp_recv_bytes']}/{size_bytes} bytes")
+                break
+            else:
+                continue
+            break
+        else:
+            continue
+        break
 
     raw_csv = SCRIPT_DIR / "results.csv"
     with open(raw_csv, "w", newline="") as f:
@@ -275,20 +277,21 @@ def main():
     for r in results:
         key = (r["size_bytes"], r["drop_pct"])
         if key not in summary:
-            summary[key] = {"tcp": [], "rudp": []}
-        if r["tcp_mbps"] > 0:
-            summary[key]["tcp"].append(r["tcp_mbps"])
-        if r["rudp_mbps"] > 0:
-            summary[key]["rudp"].append(r["rudp_mbps"])
+            summary[key] = {"rudp": [], "tcp": []}
+        if r["mbps"] > 0:
+            summary[key][r["protocol"]].append(r["mbps"])
 
     summary_rows = []
-    for (size_bytes, drop_pct), v in sorted(summary.items()):
-        summary_rows.append({
+    for (size_bytes, drop_pct) in sorted(summary.keys()):
+        row = {
             "size_bytes": size_bytes,
             "drop_pct": drop_pct,
-            "tcp_mbps_median": round(median(v["tcp"]), 2) if v["tcp"] else 0.0,
-            "rudp_mbps_median": round(median(v["rudp"]), 2) if v["rudp"] else 0.0,
-        })
+            "rudp_mbps_median": (round(median(summary[(size_bytes, drop_pct)]["rudp"]), 2)
+                                  if summary[(size_bytes, drop_pct)]["rudp"] else 0.0),
+            "tcp_mbps_median": (round(median(summary[(size_bytes, drop_pct)]["tcp"]), 2)
+                                 if summary[(size_bytes, drop_pct)]["tcp"] else 0.0),
+        }
+        summary_rows.append(row)
 
     summary_csv = SCRIPT_DIR / "summary.csv"
     with open(summary_csv, "w", newline="") as f:
@@ -297,65 +300,8 @@ def main():
         writer.writerows(summary_rows)
     log(f"Summary     -> {summary_csv}")
 
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        fig, axes = plt.subplots(1, len(FILE_SIZES), figsize=(16, 4), sharey=True)
-        for ax, (size_label, size_bytes) in zip(axes, FILE_SIZES):
-            tcp_x, tcp_y, rudp_x, rudp_y = [], [], [], []
-            for drop in DROP_RATES:
-                key = (size_bytes, drop)
-                if key in summary:
-                    if summary[key]["tcp"]:
-                        tcp_x.append(drop)
-                        tcp_y.append(median(summary[key]["tcp"]))
-                    if summary[key]["rudp"]:
-                        rudp_x.append(drop)
-                        rudp_y.append(median(summary[key]["rudp"]))
-            ax.plot(tcp_x, tcp_y, "o-", label="TCP", color="#1f77b4", linewidth=2, markersize=8)
-            ax.plot(rudp_x, rudp_y, "s-", label="RUDP", color="#ff7f0e", linewidth=2, markersize=8)
-            ax.set_title(f"{size_label} KB payload")
-            ax.set_xlabel("Packet drop rate (%)")
-            ax.set_xticks(DROP_RATES)
-            ax.grid(True, alpha=0.3)
-            ax.legend(loc="upper right")
-        axes[0].set_ylabel("Throughput (Mbps)")
-        fig.suptitle("RUDP vs TCP throughput under packet loss (loopback, WSL)",
-                     fontsize=14, fontweight="bold")
-        plt.tight_layout()
-        out1 = SCRIPT_DIR / "throughput_vs_loss.png"
-        plt.savefig(out1, dpi=120, bbox_inches="tight")
-        log(f"Graph       -> {out1}")
-        plt.close()
-
-        fig, ax = plt.subplots(figsize=(8, 5))
-        sizes_kb = [s[0] for s in FILE_SIZES]
-        tcp_0, rudp_0 = [], []
-        for size_label, size_bytes in FILE_SIZES:
-            key = (size_bytes, 0)
-            tcp_0.append(median(summary[key]["tcp"]) if key in summary and summary[key]["tcp"] else 0)
-            rudp_0.append(median(summary[key]["rudp"]) if key in summary and summary[key]["rudp"] else 0)
-        x = range(len(sizes_kb))
-        width = 0.35
-        ax.bar([i - width/2 for i in x], tcp_0, width, label="TCP", color="#1f77b4")
-        ax.bar([i + width/2 for i in x], rudp_0, width, label="RUDP", color="#ff7f0e")
-        ax.set_xticks(list(x))
-        ax.set_xticklabels([f"{s} KB" for s in sizes_kb])
-        ax.set_ylabel("Throughput (Mbps)")
-        ax.set_xlabel("File size")
-        ax.set_title("TCP vs RUDP on a clean link (0% packet loss)")
-        ax.legend()
-        ax.grid(True, alpha=0.3, axis="y")
-        plt.tight_layout()
-        out2 = SCRIPT_DIR / "throughput_vs_size.png"
-        plt.savefig(out2, dpi=120, bbox_inches="tight")
-        log(f"Graph       -> {out2}")
-        plt.close()
-    except ImportError:
-        log("matplotlib not available; skipping graphs")
-
+    log(f"Total elapsed: {(time.perf_counter() - bench_start) / 60:.1f} min")
+    log("Run analyze.py separately to generate graphs.")
     log("Done.")
 
 
@@ -363,4 +309,10 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        log("Interrupted")
+        log("Interrupted; cleaning up...")
+        subprocess.run(["pkill", "-f", "loss_proxy"])
+        subprocess.run(["pkill", "-f", "rudp_recvfile"])
+        subprocess.run(["pkill", "-f", "rudp_sendfile"])
+        subprocess.run(["pkill", "-f", "tcp_recvfile"])
+        subprocess.run(["pkill", "-f", "tcp_sendfile"])
+        sys.exit(1)

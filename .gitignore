@@ -15,6 +15,9 @@
 # Compiled RUDP tools
 /rudp_sendfile
 /rudp_recvfile
+/benchmarks/loss_proxy
+/benchmarks/tcp_sendfile
+/benchmarks/tcp_recvfile
 
 # Python cache
 __pycache__/
