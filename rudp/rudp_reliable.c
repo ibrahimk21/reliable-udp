@@ -54,6 +54,24 @@ void rudp_receiver_set_fec(struct rudp_receiver *r, int k, int p)
     r->fec_block_parity_len = 0;
 }
 
+void rudp_sender_set_fec_v2(struct rudp_sender *s, int k, int p)
+{
+    if (k < 1 || k > FEC_MAX_K) return;
+    s->fec_k = k;
+    s->fec_p = p;
+    s->use_fec = 1;
+    s->use_fec_v2 = 1;
+}
+
+void rudp_receiver_set_fec_v2(struct rudp_receiver *r, int k, int p)
+{
+    if (k < 1 || k > FEC_MAX_K) return;
+    r->fec_k = k;
+    r->fec_p = p;
+    r->use_fec = 1;
+    r->use_fec_v2 = 1;
+}
+
 static void update_rtt(struct rudp_sender *s, int64_t sample_ms)
 {
     if (!s->rtt_initialized) {
@@ -867,6 +885,344 @@ int rudp_recv_fec_sliding(struct rudp_receiver *r,
                 memcpy(src, &sender_addr,
                        *src_len < addrlen ? *src_len : addrlen);
             return total_recv;
+        }
+    }
+}
+
+/* ---- Block-ACK FEC (Phase 8) ---- */
+
+static int sender_build_block_data_pkt(uint8_t *pkt_buf, uint32_t seq,
+                                       const void *payload, int payload_len,
+                                       int block_k)
+{
+    struct rudp_header h;
+    memset(&h, 0, sizeof(h));
+    h.type = RUDP_DATA;
+    h.seq_num = seq;
+    h.window = (uint8_t)block_k;
+    return rudp_build_packet(pkt_buf, &h, payload, payload_len);
+}
+
+static void send_block_ack(int sockfd, uint32_t block_start,
+                           uint32_t missing_bitmap,
+                           struct sockaddr_in *dest, socklen_t dest_len)
+{
+    struct rudp_header h;
+    memset(&h, 0, sizeof(h));
+    h.type = RUDP_BLOCK_ACK;
+    h.ack_num = block_start;
+    rudp_sendto(sockfd, &h, &missing_bitmap, 4,
+                (struct sockaddr *)dest, dest_len);
+}
+
+int rudp_send_block_fec(struct rudp_sender *s,
+                        const void *data, int data_len,
+                        const struct sockaddr *dest, socklen_t dest_len)
+{
+    const uint8_t *ptr = (const uint8_t *)data;
+    int remaining = data_len;
+    int K = s->fec_k > 0 ? s->fec_k : FEC_K_DEFAULT;
+    if (K > 8) K = 8;
+
+    struct pollfd pfd;
+    pfd.fd = s->sockfd;
+    pfd.events = POLLIN;
+
+    while (remaining > 0) {
+        uint32_t block_start = s->next_seq;
+        uint8_t data_pkts[FEC_MAX_K][MAX_PAYLOAD_SIZE];
+        uint8_t wire_pkts[FEC_MAX_K][MAX_PACKET_SIZE];
+        int wire_lens[FEC_MAX_K];
+        int data_lens[FEC_MAX_K];
+        int block_count = 0;
+        int max_len = 0;
+
+        memset(data_pkts, 0, sizeof(data_pkts));
+        memset(wire_lens, 0, sizeof(wire_lens));
+        memset(data_lens, 0, sizeof(data_lens));
+
+        while (block_count < K && remaining > 0) {
+            int chunk = remaining;
+            if (chunk > MAX_PAYLOAD_SIZE) chunk = MAX_PAYLOAD_SIZE;
+            memcpy(data_pkts[block_count], ptr, (size_t)chunk);
+            data_lens[block_count] = chunk;
+            if (chunk > max_len) max_len = chunk;
+            ptr += chunk;
+            remaining -= chunk;
+            block_count++;
+        }
+
+        if (block_count <= 0) break;
+
+        for (int i = 0; i < block_count; i++) {
+            uint32_t seq = block_start + (uint32_t)i;
+            wire_lens[i] = sender_build_block_data_pkt(wire_pkts[i], seq,
+                                                       data_pkts[i], data_lens[i],
+                                                       block_count);
+            if (wire_lens[i] < 0) return -1;
+        }
+
+        const uint8_t *data_ptrs[FEC_MAX_K];
+        for (int i = 0; i < block_count; i++) data_ptrs[i] = data_pkts[i];
+        uint8_t parity[MAX_PAYLOAD_SIZE];
+        fec_xor_parity(data_ptrs, block_count, max_len, parity);
+
+        uint8_t parity_pkt[MAX_PACKET_SIZE];
+        int parity_len = sender_build_fec_pkt(parity_pkt, block_start,
+                                              parity, max_len,
+                                              block_count, 1, 0);
+        if (parity_len < 0) return -1;
+
+        for (int i = 0; i < block_count; i++) {
+            if (sendto(s->sockfd, wire_pkts[i], wire_lens[i], 0, dest, dest_len) < 0)
+                return -1;
+        }
+        if (sendto(s->sockfd, parity_pkt, parity_len, 0, dest, dest_len) < 0)
+            return -1;
+
+        int retx_count = 0;
+        int retransmitted = 0;
+        int64_t send_ts = now_ms();
+
+        for (;;) {
+            int ret = poll(&pfd, 1, s->rto_ms);
+            if (ret < 0) return -1;
+
+            if (ret > 0 && (pfd.revents & POLLIN)) {
+                int done = 0;
+                for (;;) {
+                    uint8_t raw[MAX_PACKET_SIZE];
+                    struct sockaddr_in from;
+                    socklen_t from_len = sizeof(from);
+                    int n = (int)recvfrom(s->sockfd, raw, sizeof(raw),
+                                          MSG_DONTWAIT,
+                                          (struct sockaddr *)&from, &from_len);
+                    if (n < 0) break;
+
+                    struct rudp_header h;
+                    const void *ack_payload;
+                    int pay_len = rudp_parse_packet(raw, n, &h, &ack_payload);
+                    if (pay_len < 4 || h.type != RUDP_BLOCK_ACK) continue;
+                    if (h.ack_num != block_start) continue;
+
+                    uint32_t missing_bitmap;
+                    memcpy(&missing_bitmap, ack_payload, 4);
+
+                    if (missing_bitmap == 0) {
+                        if (!retransmitted) {
+                            int64_t sample = now_ms() - send_ts;
+                            if (sample >= 0) update_rtt(s, sample);
+                        }
+                        s->next_seq = block_start + (uint32_t)block_count;
+                        s->send_base = s->next_seq;
+                        done = 1;
+                        break;
+                    }
+
+                    for (int i = 0; i < block_count; i++) {
+                        if (missing_bitmap & (1u << i)) {
+                            if (sendto(s->sockfd, wire_pkts[i], wire_lens[i],
+                                       0, dest, dest_len) < 0)
+                                return -1;
+                        }
+                    }
+                    retx_count++;
+                    retransmitted = 1;
+                    send_ts = now_ms();
+                    if (retx_count > MAX_RETRANSMITS) return -1;
+                }
+                if (done) break;
+            } else {
+                retx_count++;
+                retransmitted = 1;
+                if (retx_count > MAX_RETRANSMITS) return -1;
+                for (int i = 0; i < block_count; i++) {
+                    if (sendto(s->sockfd, wire_pkts[i], wire_lens[i], 0,
+                               dest, dest_len) < 0)
+                        return -1;
+                }
+                if (sendto(s->sockfd, parity_pkt, parity_len, 0, dest, dest_len) < 0)
+                    return -1;
+                send_ts = now_ms();
+            }
+        }
+    }
+
+    return data_len;
+}
+
+static uint32_t block_missing_bitmap(const int *packet_set, int block_k)
+{
+    uint32_t missing = 0;
+    for (int i = 0; i < block_k; i++) {
+        if (!packet_set[i]) missing |= (1u << i);
+    }
+    return missing;
+}
+
+static int block_present_count(const int *packet_set, int block_k)
+{
+    int present = 0;
+    for (int i = 0; i < block_k; i++) {
+        if (packet_set[i]) present++;
+    }
+    return present;
+}
+
+static void block_deliver(struct rudp_receiver *r, int block_k,
+                          uint8_t *out, int buf_size, int *total_recv)
+{
+    for (int i = 0; i < block_k; i++) {
+        int len = r->packet_lens[i];
+        if (len <= 0 || buf_size <= 0 || *total_recv >= buf_size) continue;
+        int copy = len;
+        if (*total_recv + copy > buf_size) copy = buf_size - *total_recv;
+        memcpy(out + *total_recv, r->packet_bufs[i], (size_t)copy);
+        *total_recv += copy;
+    }
+}
+
+static int block_try_finish(struct rudp_receiver *r, int block_k,
+                            uint8_t *out, int buf_size, int *total_recv)
+{
+    int present = block_present_count(r->packet_set, block_k);
+    if (present == block_k) {
+        block_deliver(r, block_k, out, buf_size, total_recv);
+        return 1;
+    }
+
+    if (present == block_k - 1 && r->fec_block_parity_present) {
+        int missing_idx = -1;
+        int max_len = r->fec_block_parity_len;
+        for (int i = 0; i < block_k; i++) {
+            if (!r->packet_set[i]) missing_idx = i;
+            else if (r->packet_lens[i] > max_len) max_len = r->packet_lens[i];
+        }
+        if (missing_idx < 0) return 0;
+        if (max_len > MAX_PAYLOAD_SIZE) max_len = MAX_PAYLOAD_SIZE;
+
+        const uint8_t *present_pkts[FEC_MAX_K];
+        int n_present = 0;
+        for (int i = 0; i < block_k; i++) {
+            if (r->packet_set[i]) present_pkts[n_present++] = r->packet_bufs[i];
+        }
+        fec_xor_recover(r->packet_bufs[missing_idx], present_pkts, n_present,
+                        missing_idx, max_len, r->fec_block_parity);
+        r->packet_lens[missing_idx] = max_len;
+        r->packet_set[missing_idx] = 1;
+        block_deliver(r, block_k, out, buf_size, total_recv);
+        return 1;
+    }
+
+    return 0;
+}
+
+static void block_reset_receiver(struct rudp_receiver *r, int block_k)
+{
+    for (int i = 0; i < block_k; i++) {
+        r->packet_lens[i] = 0;
+        r->packet_set[i] = 0;
+        memset(r->packet_bufs[i], 0, MAX_PAYLOAD_SIZE);
+    }
+    r->next_expected += (uint32_t)block_k;
+    r->fec_block_start = r->next_expected;
+    r->fec_block_parity_present = 0;
+    r->fec_block_parity_len = 0;
+}
+
+int rudp_recv_block_fec(struct rudp_receiver *r,
+                        void *buf, int buf_size,
+                        struct sockaddr *src, socklen_t *src_len,
+                        float drop_rate)
+{
+    uint8_t *out = (uint8_t *)buf;
+    int total_recv = 0;
+    int block_k = 0;
+
+    while (1) {
+        uint8_t raw[MAX_PACKET_SIZE];
+        struct sockaddr_in sender_addr;
+        socklen_t addrlen = sizeof(sender_addr);
+
+        int n = (int)recvfrom(r->sockfd, raw, sizeof(raw), 0,
+                              (struct sockaddr *)&sender_addr, &addrlen);
+        if (n < 0) return -1;
+
+        if (drop_rate > 0.0f &&
+            (float)rand() / (float)RAND_MAX < drop_rate)
+            continue;
+
+        struct rudp_header h;
+        const void *payload_ptr;
+        int pay_len = rudp_parse_packet(raw, n, &h, &payload_ptr);
+        if (pay_len < 0) continue;
+
+        if (h.type == RUDP_FIN) {
+            if (src && src_len)
+                memcpy(src, &sender_addr,
+                       *src_len < addrlen ? *src_len : addrlen);
+            return total_recv;
+        }
+
+        if (h.type == RUDP_DATA) {
+            int pkt_block_k = h.window > 0 ? h.window : r->fec_k;
+            if (pkt_block_k < 1 || pkt_block_k > 8) continue;
+            if (h.seq_num < r->next_expected) {
+                uint32_t old_start = h.seq_num - ((h.seq_num - 1) % (uint32_t)pkt_block_k);
+                send_block_ack(r->sockfd, old_start, 0, &sender_addr, addrlen);
+                continue;
+            }
+            if (block_k == 0) block_k = pkt_block_k;
+            uint32_t offset = h.seq_num - r->next_expected;
+            if (offset >= (uint32_t)block_k) continue;
+
+            int copy = pay_len;
+            if (copy > MAX_PAYLOAD_SIZE) copy = MAX_PAYLOAD_SIZE;
+            memcpy(r->packet_bufs[offset], payload_ptr, (size_t)copy);
+            r->packet_lens[offset] = copy;
+            r->packet_set[offset] = 1;
+        } else if (h.type == RUDP_FEC) {
+            if (pay_len < 1) continue;
+            const uint8_t *fec_payload = (const uint8_t *)payload_ptr;
+            int pkt_block_k = ((fec_payload[0] >> 5) & 0x07) + 1;
+            if (pkt_block_k < 1 || pkt_block_k > 8) continue;
+            if (h.seq_num < r->next_expected) {
+                send_block_ack(r->sockfd, h.seq_num, 0, &sender_addr, addrlen);
+                continue;
+            }
+            if (h.seq_num != r->next_expected) continue;
+            if (block_k == 0) block_k = pkt_block_k;
+            if (pkt_block_k != block_k) continue;
+
+            int parity_len = pay_len - 1;
+            if (parity_len > MAX_PAYLOAD_SIZE) parity_len = MAX_PAYLOAD_SIZE;
+            memcpy(r->fec_block_parity, fec_payload + 1, (size_t)parity_len);
+            r->fec_block_parity_len = parity_len;
+            r->fec_block_parity_present = 1;
+        } else {
+            continue;
+        }
+
+        if (block_k > 0 && block_try_finish(r, block_k, out, buf_size, &total_recv)) {
+            uint32_t done_start = r->next_expected;
+            send_block_ack(r->sockfd, done_start, 0, &sender_addr, addrlen);
+            block_reset_receiver(r, block_k);
+            block_k = 0;
+            if (buf_size > 0 && total_recv >= buf_size) {
+                if (src && src_len)
+                    memcpy(src, &sender_addr,
+                           *src_len < addrlen ? *src_len : addrlen);
+                return total_recv;
+            }
+            continue;
+        }
+
+        if (block_k > 0 && r->fec_block_parity_present) {
+            uint32_t missing = block_missing_bitmap(r->packet_set, block_k);
+            if (missing != 0) {
+                send_block_ack(r->sockfd, r->next_expected, missing,
+                               &sender_addr, addrlen);
+            }
         }
     }
 }

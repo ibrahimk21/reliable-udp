@@ -99,6 +99,39 @@ Updated `benchmarks/RESULTS.md` with the 3-way comparison, regenerated graphs vi
 
 **Tally: 89/89 unit tests pass. ~1,400 lines of C, zero external libraries.**
 
+## Phase 8 — Block-ACK FEC (the fix)
+
+Phase 7 showed that naive XOR FEC + sliding-window ARQ is a pessimization.
+Phase 8 redesigns the transport around block-ACK flow control, proving
+that the **same 50-line XOR code** delivers the promised FEC win when
+correctly integrated.
+
+- New packet type `RUDP_BLOCK_ACK = 0x06` — block-level ACK with
+  missing-packet bitmap.
+- `rudp_send_block_fec` / `rudp_recv_block_fec` — sender sends K data + P
+  parity as one block, waits for one block-ACK. Receiver recovers single
+  losses from parity at zero latency; sends bitmap retransmit request
+  only for unrecoverable blocks (>P losses).
+- 1 block in flight at a time (no sliding window). K=8 data, P=1 parity,
+  same XOR code as Phase 7.
+- `-fecv2 [K=N]` CLI flag added to `rudp_sendfile` / `rudp_recvfile`.
+  `-fec` still uses the Phase 7 path; `-fecv2` uses the new path.
+- **99 unit tests pass**: 17+13+16+9+8+8+4+24 = 99 (tests: checksum,
+  echo, reliable, sliding, RTO, FEC, FECv2, file transfer with all
+  three FEC modes).
+- **4-way benchmark** (137/144 trials, 28.3 min). Results:
+  - **FECv2 beats RUDP at 1-10% loss** — 66% faster at 1MB/10% drop,
+    18% faster at 10MB/5% drop, 32% faster at 100KB/10% drop.
+  - **FECv2 always beats FECv1** — the architectural fix eliminates
+    the Phase 7 regression at every measurement point.
+  - **FECv2 pays a pipeline tax at 0% loss** (~40% slower than RUDP)
+    because 1-block-in-flight cannot match the sliding window's
+    throughput on clean links. This is a design tradeoff, not a bug.
+- Documents updated: `benchmarks/RESULTS.md` rewritten for 4-way
+  comparison; `RUDP_PROJECT.md` updated with Phase 8 section.
+
+**Tally: 99/99 unit tests pass. ~1,700 lines of C, zero external libraries.**
+
 ---
 
 ## Tuning constants

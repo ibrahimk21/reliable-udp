@@ -2,7 +2,7 @@
 
 A complete implementation of a **Reliable UDP** (RUDP) protocol written in C over POSIX sockets, with a sliding window, Selective ACK (SACK), adaptive retransmission timeout, and a working file-transfer application on top. No external libraries — just the C standard library and BSD sockets.
 
-75+ unit tests pass across 0–100% packet drop scenarios. End-to-end file transfers are MD5-verified. Includes an optional Forward Erasure Correction (FEC) layer.
+99 unit tests pass across 0–100% packet drop scenarios. End-to-end file transfers are MD5-verified. Includes two implementations of Forward Erasure Correction (FEC) — a naive layered version (Phase 7) and a correct block-ACK version (Phase 8).
 
 ---
 
@@ -10,7 +10,7 @@ A complete implementation of a **Reliable UDP** (RUDP) protocol written in C ove
 
 Transmits a byte stream reliably over UDP. Under the hood: 14-byte packed binary header with Internet checksum, in-order delivery, automatic retransmission, sliding-window flow control with Selective ACK, and a dynamic RTO that adapts to measured round-trip time.
 
-The whole thing is roughly 1,400 lines of C in a single `rudp/` directory.
+The whole thing is roughly 1,700 lines of C in a single `rudp/` directory.
 
 ---
 
@@ -21,7 +21,13 @@ The whole thing is roughly 1,400 lines of C in a single `rudp/` directory.
 - **Sliding window** with per-packet sender slots (window = 32), Selective ACK bitmap for efficient gap reporting.
 - **Out-of-order buffering** on the receiver side, with in-order delivery to the application.
 - **Adaptive RTT/RTO** using RFC 6298 Jacobson/Karels with fixed-point arithmetic and Karn's algorithm (no RTT sampling for retransmitted packets).
-- **Forward Erasure Correction (XOR FEC)** — optional, K=8 data packets per block plus 1 parity packet. Receiver recovers a single lost packet per block without ARQ. See `rudp/fec.c` (~50 lines).
+- **Forward Erasure Correction** — two implementations demonstrating the architectural lesson:
+  - **FECv1** (naive): XOR parity layered on top of sliding-window ARQ. Works correctly but is
+    *slower* than plain RUDP (proving FEC requires flow-control changes).
+  - **FECv2** (block-ACK): same XOR code, but with block-level ACK flow control. Receiver recovers
+    single lost packets per block from parity at zero latency. **Faster than RUDP at 1-10% loss**
+    (66% faster at 1MB/10% drop). See `benchmarks/RESULTS.md`.
+- **File transfer application** — `rudp_sendfile` and `rudp_recvfile` CLI tools with a small metadata header (magic, size, filename) for handshake. Add `-fec` (FECv1) or `-fecv2` (FECv2) to enable forward error correction.
 - **File transfer application** — `rudp_sendfile` and `rudp_recvfile` CLI tools with a small metadata header (magic, size, filename) for handshake. Add `-fec` to enable forward error correction.
 - **Configurable server-side packet drop** for testing under lossy conditions without external tools.
 - **89 tests** — unit tests for the checksum, header, ARQ, sliding window, RTO, FEC, and end-to-end file integrity.
@@ -74,9 +80,11 @@ gcc -Wall -Wextra -pedantic -std=c99 -pthread \
 gcc -Wall -Wextra -pedantic -std=c99 -pthread \
     -o test_sliding test_sliding.c rudp.c rudp_reliable.c
 gcc -Wall -Wextra -pedantic -std=c99 -pthread \
-    -o test_rto test_rto.c rudp.c rudp_reliable.c
+    -o test_rto test_rto.c rudp.c rudp_reliable.c fec.c
 gcc -Wall -Wextra -pedantic -std=c99 -pthread \
     -o test_fec test_fec.c fec.c
+gcc -Wall -Wextra -pedantic -std=c99 -pthread \
+    -o test_fec_v2 test_fec_v2.c rudp.c rudp_reliable.c fec.c
 gcc -Wall -Wextra -pedantic -std=c99 -pthread \
     -o test_file test_file.c rudp.c rudp_reliable.c fec.c
 gcc -Wall -Wextra -pedantic -std=c99 -pthread \
@@ -94,7 +102,8 @@ Run the test suite (each binary is a standalone test runner):
 ./test_sliding     #  9 tests: sliding window + SACK
 ./test_rto         #  8 tests: RTT convergence + Karn
 ./test_fec         #  8 tests: XOR encoder/decoder
-./test_file        # 18 tests: file transfer at 0/10/30/50% drop, with/without FEC
+./test_fec_v2      #  4 tests: block-ACK FEC transport
+./test_file        # 24 tests: file transfer at 0/10/30/50% drop, with/without FEC/FECv2
 ```
 
 End-to-end file transfer (in two terminals):
@@ -117,15 +126,17 @@ Test with simulated packet loss:
 Test with Forward Erasure Correction:
 
 ```bash
-# Receiver enables XOR FEC (K=8, P=1)
+# FECv1 — naive layered FEC (Phase 7, slower than RUDP under loss)
 ./rudp_recvfile 17000 received.bin -fec
-
-# Sender matches: must use same K
 ./rudp_sendfile 127.0.0.1 17000 myfile.bin -fec
 
+# FECv2 — block-ACK FEC (Phase 8, faster than RUDP at 1-10% loss)
+./rudp_recvfile 17000 received.bin -fecv2
+./rudp_sendfile 127.0.0.1 17000 myfile.bin -fecv2
+
 # Custom K: e.g. K=4
-./rudp_recvfile 17000 received.bin -fec K=4
-./rudp_sendfile 127.0.0.1 17000 myfile.bin -fec K=4
+./rudp_recvfile 17000 received.bin -fecv2 K=4
+./rudp_sendfile 127.0.0.1 17000 myfile.bin -fecv2 K=4
 ```
 
 ---
@@ -149,13 +160,13 @@ End-to-end CLI verified with `md5sum` on a 100KB random file at 20% packet drop.
 
 ## Benchmarks
 
-RUDP, RUDP-FEC, and TCP compared head-to-head on loopback under varying packet loss. Full results and methodology in [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
+RUDP, RUDP-FEC (v1), RUDP-FECv2 (block-ACK), and TCP compared head-to-head on loopback under varying packet loss. Full results and methodology in [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
 
 ### Throughput vs packet loss
 
 ![Throughput vs packet loss](./benchmarks/throughput_vs_loss.png)
 
-Each panel is one file size. Three protocols: RUDP (ARQ only), RUDP-FEC (ARQ + XOR parity, K=8), and TCP. RUDP-FEC is slower than RUDP at 1-10% loss in this implementation — naive XOR FEC layered on sliding-window ARQ is a pessimization in that range; see RESULTS.md for the architectural analysis.
+Each panel is one file size. Four protocols: RUDP (ARQ only), FECv1 (naive XOR parity + sliding-window), FECv2 (block-ACK XOR FEC), and TCP. FECv2 is the only FEC variant that beats ARQ at 1-10% loss — the architectural fix (block-ACK instead of sliding-window ARQ + FEC) eliminates the Phase 7 pessimization. See RESULTS.md for the full analysis.
 
 ### Key numbers (10 MB payload, 0% loss)
 
@@ -163,7 +174,8 @@ Each panel is one file size. Three protocols: RUDP (ARQ only), RUDP-FEC (ARQ + X
 |----------|-----------:|----------------|
 | TCP | ~1.27 Gbps | compiled C (`tcp_sendfile` / `tcp_recvfile`) |
 | RUDP | ~316 Mbps | compiled C (`rudp_sendfile` / `rudp_recvfile`) |
-| RUDP-FEC | ~503 Mbps | compiled C (`rudp_sendfile`/`rudp_recvfile` with `-fec`) |
+| RUDP-FEC (v1) | ~503 Mbps | compiled C with `-fec` |
+| RUDP-FEC (v2) | ~268 Mbps | compiled C with `-fecv2` (slower at 0% due to block-pipeline tradeoff) |
 
 All three are kernel-bypass userspace implementations talking over loopback; the rankings reflect a combination of protocol design and code-path overhead.
 
@@ -235,5 +247,6 @@ For the full deep-dive — header byte layout, all algorithms in pseudocode, the
     ├── test_sliding.c
     ├── test_rto.c
     ├── test_fec.c        # 8 unit tests for XOR FEC
-    └── test_file.c
+    ├── test_fec_v2.c     # 4 unit tests for block-ACK FEC
+    └── test_file.c       # 24 tests: file transfer + FEC modes
 ```

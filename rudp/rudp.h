@@ -16,6 +16,7 @@ enum rudp_type {
     RUDP_SYN  = 3,
     RUDP_FIN  = 4,
     RUDP_FEC  = 5,
+    RUDP_BLOCK_ACK = 6,
 };
 
 struct rudp_header {

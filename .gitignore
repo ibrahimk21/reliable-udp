@@ -17,6 +17,7 @@
 /rudp/test_sliding
 /rudp/test_rto
 /rudp/test_fec
+/rudp/test_fec_v2
 /rudp/test_file
 /run_tests.sh
 

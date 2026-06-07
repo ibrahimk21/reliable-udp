@@ -3,9 +3,9 @@
 Generate matplotlib graphs from benchmark results.
 
 Reads:
-  summary.csv
-    columns: size_bytes, drop_pct, rudp_mbps_median, rudp_fec_mbps_median,
-             tcp_mbps_median
+    summary.csv
+      columns: size_bytes, drop_pct, rudp_mbps_median, rudp_fec_mbps_median,
+              rudp_fec_v2_mbps_median, tcp_mbps_median
 
 Writes:
   throughput_vs_loss.png   - one panel per file size
@@ -32,6 +32,7 @@ def load_summary():
             row["drop_pct"] = int(row["drop_pct"])
             row["rudp_mbps_median"] = float(row["rudp_mbps_median"])
             row["rudp_fec_mbps_median"] = float(row.get("rudp_fec_mbps_median", 0))
+            row["rudp_fec_v2_mbps_median"] = float(row.get("rudp_fec_v2_mbps_median", 0))
             row["tcp_mbps_median"] = float(row["tcp_mbps_median"])
             rows.append(row)
     return rows
@@ -64,9 +65,11 @@ def plot_throughput_vs_loss(rows):
         sub = sorted(by_size[size_bytes], key=lambda r: r["drop_pct"])
         rudp    = [r["rudp_mbps_median"]    for r in sub]
         rudp_fec = [r["rudp_fec_mbps_median"] for r in sub]
+        rudp_fec_v2 = [r["rudp_fec_v2_mbps_median"] for r in sub]
         tcp     = [r["tcp_mbps_median"]     for r in sub]
         ax.plot(drop_pcts[:len(sub)], rudp,     "o-", label="RUDP",     linewidth=2)
         ax.plot(drop_pcts[:len(sub)], rudp_fec, "^-", label="RUDP-FEC", linewidth=2)
+        ax.plot(drop_pcts[:len(sub)], rudp_fec_v2, "D-", label="RUDP-FECv2", linewidth=2)
         ax.plot(drop_pcts[:len(sub)], tcp,      "s-", label="TCP",      linewidth=2)
         ax.set_title(f"{label_for(size_bytes)} file")
         ax.set_xlabel("Drop rate (%)")
@@ -77,7 +80,7 @@ def plot_throughput_vs_loss(rows):
     for idx in range(n, rows_grid * cols):
         axes[idx // cols][idx % cols].axis("off")
 
-    fig.suptitle("RUDP vs RUDP-FEC vs TCP: Throughput vs Loss Rate "
+    fig.suptitle("RUDP vs RUDP-FEC vs RUDP-FECv2 vs TCP: Throughput vs Loss Rate "
                  "(medians, fair C-vs-C loopback test)", fontsize=13)
     fig.tight_layout()
     out = SCRIPT_DIR / "throughput_vs_loss.png"
@@ -99,26 +102,29 @@ def plot_throughput_vs_size(rows):
     labels   = [label_for(r["size_bytes"]) for r in sub]
     rudp     = [r["rudp_mbps_median"]      for r in sub]
     rudp_fec = [r["rudp_fec_mbps_median"]  for r in sub]
+    rudp_fec_v2 = [r["rudp_fec_v2_mbps_median"] for r in sub]
     tcp      = [r["tcp_mbps_median"]       for r in sub]
 
     fig, ax = plt.subplots(figsize=(9, 5))
     x = range(len(labels))
-    w = 0.28
-    ax.bar([i - w     for i in x], rudp,     w, label="RUDP",     color="tab:blue")
-    ax.bar([i         for i in x], rudp_fec, w, label="RUDP-FEC", color="tab:green")
-    ax.bar([i + w     for i in x], tcp,      w, label="TCP",      color="tab:orange")
+    w = 0.20
+    ax.bar([i - 1.5*w for i in x], rudp,        w, label="RUDP",       color="tab:blue")
+    ax.bar([i - 0.5*w for i in x], rudp_fec,    w, label="RUDP-FEC",   color="tab:green")
+    ax.bar([i + 0.5*w for i in x], rudp_fec_v2, w, label="RUDP-FECv2", color="tab:red")
+    ax.bar([i + 1.5*w for i in x], tcp,         w, label="TCP",        color="tab:orange")
     ax.set_xticks(list(x))
     ax.set_xticklabels(labels)
     ax.set_xlabel("File size")
     ax.set_ylabel("Throughput (Mbps)")
-    ax.set_title("RUDP vs RUDP-FEC vs TCP at 0% Loss (median of trials)")
+    ax.set_title("RUDP vs RUDP-FEC vs RUDP-FECv2 vs TCP at 0% Loss (median of trials)")
     ax.grid(True, axis="y", alpha=0.3)
     ax.legend()
-    all_vals = rudp + rudp_fec + tcp
-    for i, (a, b, c) in enumerate(zip(rudp, rudp_fec, tcp)):
-        ax.text(i - w, a + max(all_vals) * 0.01, f"{a:.0f}", ha="center", fontsize=8)
-        ax.text(i,     b + max(all_vals) * 0.01, f"{b:.0f}", ha="center", fontsize=8)
-        ax.text(i + w, c + max(all_vals) * 0.01, f"{c:.0f}", ha="center", fontsize=8)
+    all_vals = rudp + rudp_fec + rudp_fec_v2 + tcp
+    for i, (a, b, c, d) in enumerate(zip(rudp, rudp_fec, rudp_fec_v2, tcp)):
+        ax.text(i - 1.5*w, a + max(all_vals) * 0.01, f"{a:.0f}", ha="center", fontsize=8)
+        ax.text(i - 0.5*w, b + max(all_vals) * 0.01, f"{b:.0f}", ha="center", fontsize=8)
+        ax.text(i + 0.5*w, c + max(all_vals) * 0.01, f"{c:.0f}", ha="center", fontsize=8)
+        ax.text(i + 1.5*w, d + max(all_vals) * 0.01, f"{d:.0f}", ha="center", fontsize=8)
 
     fig.tight_layout()
     out = SCRIPT_DIR / "throughput_vs_size.png"

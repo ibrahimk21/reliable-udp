@@ -19,6 +19,7 @@ This document explains every design decision, every algorithm, and every bug enc
 9. [Phase 5 — RTT Sampling & RTO Computation](#9-phase-5--rtt-sampling--rto-computation)
 10. [Phase 6 — File Transfer Application](#10-phase-6--file-transfer-application)
 10a. [Phase 7 — Forward Erasure Correction (XOR FEC)](#10a-phase-7--forward-erasure-correction-xor-fec)
+10b. [Phase 8 — Block-ACK FEC (the fix)](#10b-phase-8--block-ack-fec-the-fix)
 11. [Bugs Hit During Development (and What They Taught)](#11-bugs-hit-during-development-and-what-they-taught)
 12. [Test Summary](#12-test-summary)
 13. [Interview Talking Points](#13-interview-talking-points)
@@ -672,6 +673,132 @@ Full results in [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
 
 ---
 
+## 10b. Phase 8 — Block-ACK FEC (the fix)
+
+Phase 7 proved that bolting XOR parity onto sliding-window ARQ makes
+performance *worse*. Phase 8 fixes the architectural mismatch by
+replacing the flow control: one block in flight at a time, block-level
+ACKs, parity-only recovery, and ARQ only when the block is unrecoverable.
+
+### 10b.1 Block-ACK protocol
+
+A new packet type `RUDP_BLOCK_ACK = 0x06`. The sender sends K data
+packets followed by P parity packets as a single conceptual block.
+The receiver waits until it has enough information (all K+P packets
+received, or parity+K-1 received) to deliver the block or declare it
+unreachable.
+
+The block-ACK payload is a 32-bit bitmap where bit `i` = 1 means "packet
+i of the block is missing". `bitmap = 0` means the block was delivered
+successfully (possibly recovered from parity). The sender advances to
+the next block only when it receives `bitmap = 0`.
+
+### 10b.2 Sender algorithm (`rudp_send_block_fec`)
+
+```
+for each block:
+  1. Buffer K data packets (or fewer for final partial block).
+  2. Compute XOR parity over all K data packets at max-payload length.
+  3. Send all K data packets and the parity packet.
+  4. Start RTO timer; wait for a block-ACK.
+  5. On block-ACK with bitmap=0: block delivered, advance to next block.
+  6. On block-ACK with bitmap>0: retransmit only the data packets
+     whose bitmap bits are set, then go to step 4.
+  7. On RTO timeout: retransmit all K data + 1 parity (maybe the
+     block-ACK was lost), then go to step 4.
+  8. Give up after MAX_RETRANSMITS.
+```
+
+Key difference from Phase 7: no sliding window. The sender cannot send
+more than one block at a time. The RTT measurement uses the single
+block-ACK's arrival time (Karn's algorithm still applies).
+
+### 10b.3 Receiver algorithm (`rudp_recv_block_fec`)
+
+```
+for each received packet:
+  1. If FIN: deliver partial block (whatever is in the buffer), return.
+  2. If DATA: buffer at offset `seq - block_start`. Track block_k from
+     the header's window field.
+  3. If FEC (parity): buffer parity; set parity_present flag.
+  4. If parity_present and K-1 data are present:
+     recover the missing data via fec_xor_recover, deliver block,
+     send block-ACK bitmap=0, advance to next block.
+  5. If all K data packets are present (no parity needed):
+     deliver block, send block-ACK bitmap=0, advance.
+  6. If parity_present and <K-1 data present:
+     send block-ACK with bitmap of missing data packets.
+     (The block is unrecoverable as-is; sender must retransmit.)
+```
+
+### 10b.4 Edge cases
+
+- **Final partial block**: no parity sent. Block-count K reflected in
+  the DATA packets' window field. On RUDP_FIN, receiver delivers
+  whatever data is in the buffer.
+- **Old block ACKs**: if the sender retransmits an old block (RTO),
+  the receiver has moved past it. The receiver detects `seq <
+  next_expected` and sends a gratuitous block-ACK with bitmap=0
+  to tell the sender to stop.
+- **Parity lost**: same as any other packet — if parity is lost and
+  K data packets arrived, the receiver just delivers (no parity
+  needed). If parity is lost and K-1 data + parity are needed, the
+  receiver sends a bitmap requesting the missing data packet.
+- **RTO on last-block ACK**: the sender retransmits the last block
+  (data + parity). The receiver already delivered it; it responds
+  with a gratuitous block-ACK. The sender advances.
+
+### 10b.5 Performance model
+
+The block-ACK design alters the throughput equation:
+
+| Loss rate | P(>1 loss / 8-block) | Expected ARQ triggers per MB | FECv2 | RUDP |
+|-----------|----------------------|-----------------------------|-------|------|
+| 0%        | 0.0%                | 0                            | ~260 Mbps | ~515 Mbps |
+| 1%        | 0.1%                | ~0.13                        | ~6.6 Mbps | ~6.1 Mbps |
+| 5%        | 1.2%                | ~1.5                         | ~1.64 Mbps | ~1.65 Mbps |
+| 10%       | 5.7%                | ~7.3                         | ~0.88 Mbps | ~0.53 Mbps |
+
+The 0% loss gap (pipeline tax) is because 1-block-in-flight sends K=8
+data + 1 parity per RTT, while RUDP's sliding window sends up to 32
+packets per RTT. On loopback this is ~0.5 ms vs ~2 ms per exchange,
+so the gap is linear in block count.
+
+The 10% loss win is because FECv2 absorbs the first loss in every
+block for free (parity recovery). RUDP pays 100 ms RTO for every
+single loss. With K=8 and 10% drop, about half of the blocks have
+exactly one loss, which FECv2 absorbs for free.
+
+### 10b.6 Tests
+
+| Test file | Tests | What it covers |
+|-----------|-------|----------------|
+| `test_fec_v2.c` | 4 | End-to-end block transfer at 0% (8KB full block, 12KB partial), 10% drop, 20% drop |
+| `test_file.c` | 24 | Phase 6's 8 cases + Phase 7 FEC + Phase 8 FECv2 at 10%, 30% drop |
+
+All 99 tests pass. The total codebase grew from ~1400 to ~1700 lines.
+
+### 10b.7 Benchmark result
+
+The 4-way benchmark (RUDP, FECv1, FECv2, TCP) across 137 trials
+confirmed:
+
+- **FECv2 beats FECv1 at every point**: the architectural fix works.
+- **FECv2 matches or beats RUDP at 1-10% loss**: 66% faster at
+  1MB/10%, 18% faster at 10MB/5%, 32% faster at 100KB/10%.
+- **FECv2 pays a pipeline tax at 0% loss**: ~40% slower than RUDP
+  on clean links.
+
+This is the correct tradeoff. Sliding-window ARQ is the right baseline;
+the block-ACK FEC design wins when the link has meaningful loss but
+loses on clean links due to pipeline inefficiency. An adaptive
+approach (grow the window when losses are low, shrink to 1 block when
+losses are high) would combine the best of both — but that is Phase 9.
+
+Full results in [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
+
+---
+
 ## 11. Bugs Hit During Development (and What They Taught)
 
 These are real bugs encountered while building this protocol. **Bring these up in the interview** — they show systematic debugging.
@@ -763,10 +890,11 @@ These are real bugs encountered while building this protocol. **Bring these up i
 | 3 | `test_reliable.c` | 16 | Stop-and-wait ARQ, 0–100% drop, duplicate detection |
 | 4 | `test_sliding.c` | 9 | Sliding window, SACK, out-of-order, multi-KB payloads |
 | 5 | `test_rto.c` | 8 | RTT convergence, RTO clamp, Karn's algorithm |
-| 6 | `test_file.c` | 18 | End-to-end file transfer at 0/10/30/50% drop, with/without FEC |
+| 6 | `test_file.c` | 24 | End-to-end file transfer at 0/10/30/50% drop, with/without FEC, FECv2 |
 | 7 | `test_fec.c` | 8 | XOR encoder/decoder: identity, single-bit recovery, multi-bit recovery, padding, large buffer |
+| 8 | `test_fec_v2.c` | 4 | Block-ACK FECv2: full block, partial block, 10% drop, 20% drop |
 
-**Total: 89/89 tests pass.** Plus end-to-end CLI test with 100KB and 1MB random data at 0/10/20% drop with and without `-fec`, byte-for-byte integrity confirmed with `cmp`.
+**Total: 99/99 tests pass.** Plus end-to-end CLI test with 100KB and 1MB random data at 0/10/20% drop with `-fec`, `-fecv2`, byte-for-byte integrity confirmed with `cmp`.
 
 ---
 

@@ -49,6 +49,7 @@ struct rudp_sender {
     int fec_k;
     int fec_p;
     int use_fec;
+    int use_fec_v2;
     int fec_block_pos;
     uint32_t fec_block_start;
     int fec_block_pkt_lens[FEC_MAX_K];
@@ -74,6 +75,7 @@ struct rudp_receiver {
     int fec_k;
     int fec_p;
     int use_fec;
+    int use_fec_v2;
     uint32_t fec_block_start;
     int fec_block_parity_present;
     int fec_block_parity_len;
@@ -85,6 +87,8 @@ void rudp_receiver_init(struct rudp_receiver *r, int sockfd);
 
 void rudp_sender_set_fec(struct rudp_sender *s, int k, int p);
 void rudp_receiver_set_fec(struct rudp_receiver *r, int k, int p);
+void rudp_sender_set_fec_v2(struct rudp_sender *s, int k, int p);
+void rudp_receiver_set_fec_v2(struct rudp_receiver *r, int k, int p);
 
 int rudp_send_reliable(struct rudp_sender *s,
                        const void *payload, int payload_len,
@@ -112,6 +116,15 @@ int rudp_recv_fec_sliding(struct rudp_receiver *r,
                           void *buf, int buf_size,
                           struct sockaddr *src, socklen_t *src_len,
                           float drop_rate);
+
+int rudp_send_block_fec(struct rudp_sender *s,
+                        const void *data, int data_len,
+                        const struct sockaddr *dest, socklen_t dest_len);
+
+int rudp_recv_block_fec(struct rudp_receiver *r,
+                        void *buf, int buf_size,
+                        struct sockaddr *src, socklen_t *src_len,
+                        float drop_rate);
 
 int rudp_sender_get_rto(const struct rudp_sender *s);
 int rudp_sender_get_srtt(const struct rudp_sender *s);
