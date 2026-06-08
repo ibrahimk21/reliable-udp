@@ -18,6 +18,16 @@
 
 #define FEC_MAX_K 32
 
+#define DGRAM_QUEUE_SIZE 128
+#define RUDP_OOE_GAP_BEFORE (1u << 0)
+
+struct datagram_entry {
+    uint8_t  data[MAX_PAYLOAD_SIZE];
+    int      len;
+    uint32_t seq;
+    uint32_t flags;
+};
+
 struct sender_slot {
     uint8_t  pkt[MAX_PACKET_SIZE];
     uint32_t seq;
@@ -71,6 +81,11 @@ struct rudp_receiver {
     uint8_t  packet_bufs[WINDOW_SIZE][MAX_PAYLOAD_SIZE];
     int      packet_lens[WINDOW_SIZE];
     int      packet_set[WINDOW_SIZE];
+
+    struct datagram_entry dgram_queue[DGRAM_QUEUE_SIZE];
+    int dgram_head;
+    int dgram_tail;
+    int dgram_count;
 
     int fec_k;
     int fec_p;
@@ -128,5 +143,11 @@ int rudp_recv_block_fec(struct rudp_receiver *r,
 
 int rudp_sender_get_rto(const struct rudp_sender *s);
 int rudp_sender_get_srtt(const struct rudp_sender *s);
+
+ssize_t rudp_recv_datagram(struct rudp_receiver *r,
+                           void *buf, size_t bufsize,
+                           uint32_t *seq, uint32_t *flags,
+                           struct sockaddr *src, socklen_t *src_len,
+                           float drop_rate);
 
 #endif /* RUDP_RELIABLE_H */

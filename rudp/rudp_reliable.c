@@ -425,6 +425,119 @@ int rudp_recv_sliding(struct rudp_receiver *r,
     }
 }
 
+/* ---- Out-of-order datagram delivery (Phase 9) ---- */
+
+ssize_t rudp_recv_datagram(struct rudp_receiver *r,
+                           void *buf, size_t bufsize,
+                           uint32_t *seq, uint32_t *flags,
+                           struct sockaddr *src, socklen_t *src_len,
+                           float drop_rate)
+{
+    (void)src;
+    (void)src_len;
+
+    if (r->dgram_count > 0) {
+        struct datagram_entry *e = &r->dgram_queue[r->dgram_head];
+        int copy = e->len;
+        if ((size_t)copy > bufsize)
+            copy = (int)bufsize;
+        if (copy > 0 && buf)
+            memcpy(buf, e->data, (size_t)copy);
+        if (seq) *seq = e->seq;
+        if (flags) *flags = e->flags;
+        r->dgram_head = (r->dgram_head + 1) % DGRAM_QUEUE_SIZE;
+        r->dgram_count--;
+        return copy;
+    }
+
+    uint8_t raw[MAX_PACKET_SIZE];
+    struct sockaddr_in sender_addr;
+    socklen_t addrlen = sizeof(sender_addr);
+
+    int n = (int)recvfrom(r->sockfd, raw, sizeof(raw), 0,
+                          (struct sockaddr *)&sender_addr, &addrlen);
+    if (n < 0) return -1;
+
+    if (drop_rate > 0.0f &&
+        (float)rand() / (float)RAND_MAX < drop_rate)
+        return 0;
+
+    struct rudp_header h;
+    const void *payload_ptr;
+    int pay_len = rudp_parse_packet(raw, n, &h, &payload_ptr);
+    if (pay_len < 0) return 0;
+    if (h.type != RUDP_DATA) return 0;
+
+    uint32_t pkt_seq = h.seq_num;
+
+    if (pkt_seq < r->next_expected) {
+        send_sack(r->sockfd, r, &sender_addr, addrlen);
+        return 0;
+    }
+
+    uint32_t offset = pkt_seq - r->next_expected;
+    if (offset >= WINDOW_SIZE) {
+        send_sack(r->sockfd, r, &sender_addr, addrlen);
+        return 0;
+    }
+
+    if (r->recv_bitmap & (1u << offset))
+        return 0;
+
+    r->recv_bitmap |= (1u << offset);
+    if (pay_len > 0) {
+        int copy = pay_len;
+        if (copy > MAX_PAYLOAD_SIZE) copy = MAX_PAYLOAD_SIZE;
+        memcpy(r->packet_bufs[offset], payload_ptr, (size_t)copy);
+        r->packet_lens[offset] = copy;
+    } else {
+        r->packet_lens[offset] = 0;
+    }
+
+    if (r->dgram_count < DGRAM_QUEUE_SIZE) {
+        struct datagram_entry *e = &r->dgram_queue[r->dgram_tail];
+        int copy = pay_len;
+        if (copy > MAX_PAYLOAD_SIZE) copy = MAX_PAYLOAD_SIZE;
+        if (copy > 0)
+            memcpy(e->data, payload_ptr, (size_t)copy);
+        e->len = copy;
+        e->seq = pkt_seq;
+        uint32_t f = 0;
+        if (offset > 0) f |= RUDP_OOE_GAP_BEFORE;
+        e->flags = f;
+        r->dgram_tail = (r->dgram_tail + 1) % DGRAM_QUEUE_SIZE;
+        r->dgram_count++;
+    }
+
+    send_sack(r->sockfd, r, &sender_addr, addrlen);
+
+    while (r->recv_bitmap & 1) {
+        r->recv_bitmap >>= 1;
+        for (int i = 0; i < WINDOW_SIZE - 1; i++) {
+            r->packet_lens[i] = r->packet_lens[i + 1];
+            memcpy(r->packet_bufs[i], r->packet_bufs[i + 1], MAX_PAYLOAD_SIZE);
+        }
+        r->packet_lens[WINDOW_SIZE - 1] = 0;
+        r->next_expected++;
+    }
+
+    if (r->dgram_count > 0) {
+        struct datagram_entry *e = &r->dgram_queue[r->dgram_head];
+        int copy = e->len;
+        if ((size_t)copy > bufsize)
+            copy = (int)bufsize;
+        if (copy > 0 && buf)
+            memcpy(buf, e->data, (size_t)copy);
+        if (seq) *seq = e->seq;
+        if (flags) *flags = e->flags;
+        r->dgram_head = (r->dgram_head + 1) % DGRAM_QUEUE_SIZE;
+        r->dgram_count--;
+        return copy;
+    }
+
+    return 0;
+}
+
 /* ---- FEC sliding window (Phase 7) ---- */
 
 static int sender_build_data_pkt(uint8_t *pkt_buf, uint32_t seq,
